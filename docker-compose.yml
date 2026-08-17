@@ -1,0 +1,11 @@
+services:
+  listen:
+    build: .
+    container_name: listen
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "${LISTEN_PORT:-8200}:80"
+    env_file:
+      - .env

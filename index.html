@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Listen</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#09090b;--card:#18181b;--border:#27272a;--text:#fafafa;--muted:#a1a1aa;--accent:#e4e4e7;--dim:#52525b}
+body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:2rem}
+header{text-align:center;margin-bottom:3rem}
+h1{font-size:2.5rem;font-weight:700;letter-spacing:.15em;margin-bottom:.5rem}
+.tagline{color:var(--muted);font-size:1.1rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1.25rem;max-width:860px;width:100%}
+.card{background:var(--card);border:1px solid var(--border);border-radius:.75rem;padding:1.75rem;transition:border-color .2s,transform .15s;text-decoration:none;color:var(--text);display:flex;flex-direction:column;gap:.75rem}
+.card:hover{border-color:var(--dim);transform:translateY(-2px)}
+.card-icon{font-size:2rem;line-height:1}
+.card h2{font-size:1.15rem;font-weight:600}
+.card p{color:var(--muted);font-size:.9rem;line-height:1.45}
+.card .link{margin-top:auto;display:inline-flex;align-items:center;gap:.4rem;font-size:.85rem;color:var(--accent);font-weight:500}
+.card .link::after{content:"\u2192";transition:transform .15s}
+.card:hover .link::after{transform:translateX(3px)}
+.card .badge{display:inline-block;font-size:.7rem;text-transform:uppercase;letter-spacing:.1em;padding:.2rem .5rem;border-radius:.25rem;border:1px solid var(--border);color:var(--dim);margin-top:.25rem}
+
+/* ── Shared library section ── */
+.library{margin-top:3rem;max-width:860px;width:100%;text-align:center}
+.library-inner{position:relative;background:var(--card);border:1px solid var(--border);border-radius:.75rem;padding:2rem 1.75rem}
+.library-inner::before{content:"";position:absolute;top:-3rem;left:50%;transform:translateX(-50%);width:1px;height:3rem;background:var(--dim);opacity:.4}
+.library-label{font-size:.75rem;text-transform:uppercase;letter-spacing:.12em;color:var(--dim);margin-bottom:1rem}
+.library-icon{font-size:2.5rem;margin-bottom:.75rem;display:block}
+.library h3{font-size:1rem;font-weight:600;margin-bottom:.5rem}
+.library p{color:var(--muted);font-size:.85rem;line-height:1.5;max-width:520px;margin:0 auto}
+.library .roles{display:flex;justify-content:center;gap:2rem;margin-top:1.5rem;flex-wrap:wrap}
+.library .role{text-align:center;min-width:100px}
+.library .role-icon{font-size:1.5rem;display:block;margin-bottom:.35rem}
+.library .role strong{display:block;font-size:.9rem;color:var(--text)}
+.library .role span{font-size:.75rem;color:var(--dim)}
+
+footer{margin-top:3rem;color:#3f3f46;font-size:.8rem;letter-spacing:.05em}
+</style>
+</head>
+<body>
+<header>
+  <h1>LISTEN</h1>
+  <p class="tagline">Three apps, one library</p>
+</header>
+<div class="grid">
+  <a class="card" href="https://drivepod.example.com">
+    <span class="card-icon">&#127911;</span>
+    <h2>DrivePod</h2>
+    <p>Harvests YouTube channels into the shared library. Full player with play, pause, seek, and skip &mdash; you control exactly what plays and when.</p>
+    <span class="badge">Your control</span>
+    <span class="link">Open DrivePod</span>
+  </a>
+  <a class="card" href="https://frogrock.example.com">
+    <span class="card-icon">&#128219;</span>
+    <h2>FrogRock</h2>
+    <p>Live broadcast from the same library. No play or pause &mdash; it just plays. Every listener hears the same track at the same time, like real radio.</p>
+    <span class="badge">Broadcast</span>
+    <span class="link">Open FrogRock</span>
+  </a>
+  <a class="card" href="https://grabbytube.example.com">
+    <span class="card-icon">&#127925;</span>
+    <h2>GrabbyTube</h2>
+    <p>YouTube-to-MP3 converter that feeds the shared library with individual tracks. Search, queue, and download anything.</p>
+    <span class="badge">Add tracks</span>
+    <span class="link">Open GrabbyTube</span>
+  </a>
+</div>
+
+<div class="library">
+  <div class="library-inner">
+    <span class="library-label">Shared resource</span>
+    <span class="library-icon">&#128230;</span>
+    <h3>One Music Library</h3>
+    <p>All three projects read and write the same cache directory.</p>
+    <div class="roles">
+      <div class="role">
+        <span class="role-icon">&#127911;</span>
+        <strong>DrivePod</strong>
+        <span>Harvests &amp; plays</span>
+      </div>
+      <div class="role">
+        <span class="role-icon">&#128219;</span>
+        <strong>FrogRock</strong>
+        <span>Broadcasts live</span>
+      </div>
+      <div class="role">
+        <span class="role-icon">&#127925;</span>
+        <strong>GrabbyTube</strong>
+        <span>Adds tracks</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<footer>example.com</footer>
+</body>
+</html>
