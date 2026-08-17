@@ -18,7 +18,7 @@ h1{font-size:2.5rem;font-weight:700;letter-spacing:.15em;margin-bottom:.5rem}
 .card h2{font-size:1.15rem;font-weight:600}
 .card p{color:var(--muted);font-size:.9rem;line-height:1.45}
 .card .link{margin-top:auto;display:inline-flex;align-items:center;gap:.4rem;font-size:.85rem;color:var(--accent);font-weight:500}
-.card .link::after{content:"\u2192";transition:transform .15s}
+.card .link::after{content:"→";transition:transform .15s}
 .card:hover .link::after{transform:translateX(3px)}
 .card .badge{display:inline-block;font-size:.7rem;text-transform:uppercase;letter-spacing:.1em;padding:.2rem .5rem;border-radius:.25rem;border:1px solid var(--border);color:var(--dim);margin-top:.25rem}
 
@@ -46,14 +46,14 @@ footer{margin-top:3rem;color:#3f3f46;font-size:.8rem;letter-spacing:.05em}
 </header>
 <div class="grid">
   <a class="card" href="https://drivepod.example.com">
-    <span class="card-icon">&#127911;</span>
+    <span class="card-icon"><svg viewBox="0 0 64 64" width="40" height="40" fill="none" stroke="#a1a1aa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="14" y="18" width="36" height="28" rx="4"/><path d="M22 18V12a10 10 0 0 1 20 0v6"/><line x1="22" y1="46" x2="22" y2="52"/><line x1="42" y1="46" x2="42" y2="52"/><circle cx="28" cy="32" r="4"/><line x1="36" y1="30" x2="40" y2="30"/><line x1="36" y1="34" x2="40" y2="34"/><path d="M50 26c4-2 6-6 6-10" opacity=".6"/><path d="M54 16c4-2 6-6 6-10" opacity=".4"/></svg></span>
     <h2>DrivePod</h2>
     <p>Harvests YouTube channels into the shared library. Full player with play, pause, seek, and skip &mdash; you control exactly what plays and when.</p>
-    <span class="badge">Your control</span>
+    <span class="badge">Harvesting + player</span>
     <span class="link">Open DrivePod</span>
   </a>
   <a class="card" href="https://frogrock.example.com">
-    <span class="card-icon">&#128219;</span>
+    <span class="card-icon"><svg viewBox="0 0 64 64" width="40" height="40" fill="none" stroke="#a1a1aa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="32" cy="38" rx="18" ry="14"/><circle cx="22" cy="18" r="7"/><circle cx="42" cy="18" r="7"/><circle cx="22" cy="17" r="3" fill="#a1a1aa"/><circle cx="42" cy="17" r="3" fill="#a1a1aa"/><path d="M24 44c3 3 13 3 16 0"/><path d="M14 36L6 32"/><path d="M14 40L5 42"/><path d="M50 36l8-4"/><path d="M50 40l9 2"/></svg></span>
     <h2>FrogRock</h2>
     <p>Live broadcast from the same library. No play or pause &mdash; it just plays. Every listener hears the same track at the same time, like real radio.</p>
     <span class="badge">Broadcast</span>
@@ -62,8 +62,8 @@ footer{margin-top:3rem;color:#3f3f46;font-size:.8rem;letter-spacing:.05em}
   <a class="card" href="https://grabbytube.example.com">
     <span class="card-icon">&#127925;</span>
     <h2>GrabbyTube</h2>
-    <p>YouTube-to-MP3 converter that feeds the shared library with individual tracks. Search, queue, and download anything.</p>
-    <span class="badge">Add tracks</span>
+    <p>Snag single tracks from YouTube to fill gaps between DrivePod's channel harvests — mix-in tracks that keep the playlist flowing.</p>
+    <span class="badge">Mix-in tracks</span>
     <span class="link">Open GrabbyTube</span>
   </a>
 </div>
@@ -76,19 +76,19 @@ footer{margin-top:3rem;color:#3f3f46;font-size:.8rem;letter-spacing:.05em}
     <p>All three projects read and write the same cache directory.</p>
     <div class="roles">
       <div class="role">
-        <span class="role-icon">&#127911;</span>
+        <span class="role-icon"><svg viewBox="0 0 64 64" width="24" height="24" fill="none" stroke="#a1a1aa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="14" y="18" width="36" height="28" rx="4"/><path d="M22 18V12a10 10 0 0 1 20 0v6"/><line x1="22" y1="46" x2="22" y2="52"/><line x1="42" y1="46" x2="42" y2="52"/><circle cx="28" cy="32" r="4"/></svg></span>
         <strong>DrivePod</strong>
-        <span>Harvests &amp; plays</span>
+        <span>Harvesting + player</span>
       </div>
       <div class="role">
-        <span class="role-icon">&#128219;</span>
+        <span class="role-icon"><svg viewBox="0 0 64 64" width="24" height="24" fill="none" stroke="#a1a1aa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="32" cy="38" rx="18" ry="14"/><circle cx="22" cy="18" r="7"/><circle cx="42" cy="18" r="7"/><circle cx="22" cy="17" r="3" fill="#a1a1aa"/><circle cx="42" cy="17" r="3" fill="#a1a1aa"/><path d="M24 44c3 3 13 3 16 0"/></svg></span>
         <strong>FrogRock</strong>
         <span>Broadcasts live</span>
       </div>
       <div class="role">
         <span class="role-icon">&#127925;</span>
         <strong>GrabbyTube</strong>
-        <span>Adds tracks</span>
+        <span>Mix-in tracks</span>
       </div>
     </div>
   </div>
