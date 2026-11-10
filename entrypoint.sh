@@ -27,6 +27,12 @@ else
   echo "WireGuard: skipping (missing env vars)"
 fi
 
+# ── Publish the app links ──────────────────────────────────────────
+# index.html ships with a __DOMAIN__ placeholder so no public domain is baked
+# into the image or the repo. SITE_DOMAIN (from .env) fills it at start.
+sed -i "s|__DOMAIN__|${SITE_DOMAIN:-example.com}|g" /usr/share/nginx/html/index.html
+echo "Site links point at ${SITE_DOMAIN:-example.com}"
+
 # ── Start nginx ────────────────────────────────────────────────────
 echo "Starting nginx..."
 exec nginx -g "daemon off;"
