@@ -42,6 +42,23 @@ OUT_PATH = os.environ.get("COOKIES_FILE", "/data/cookies.txt")
 # the shared cookie file's session is dead (dead-cookie harvests only
 # hammer Google and their write-backs delay our re-seed).
 SESSION_STATE_PATH = os.environ.get("COOKIE_SESSION_STATE", "/data/session-state.json")
+# Fan-out: one Google account (one vault) can serve several partitions, but the
+# browser that mints the cookies belongs to the vault HOST only. These lists are
+# the MEMBER partitions' paths - the host's own files keep being written exactly
+# as before, and the host's exporter stays the only writer of `up` for the
+# account. COOKIE_FANOUT_FILES gets the same netscape text each primary write
+# succeeds with; COOKIE_SESSION_STATE_FANOUT gets the same state payload. Both
+# are comma lists rendered by platform/gen-conf.py from the registry; unset (a
+# vault with no members, or the standalone ytcookies deployment) keeps the
+# original single-file behavior.
+COOKIE_FANOUT_FILES = [
+    p.strip() for p in os.environ.get("COOKIE_FANOUT_FILES", "").split(",")
+    if p.strip()
+]
+COOKIE_SESSION_STATE_FANOUT = [
+    p.strip() for p in
+    os.environ.get("COOKIE_SESSION_STATE_FANOUT", "").split(",") if p.strip()
+]
 # Single-instance guard: a second watcher means two independent liveness
 # state machines (duplicate session_dead/session_restored pushes, offset by
 # each instance's probe phase) and two writers racing the consumers'
@@ -287,27 +304,91 @@ def probe_file() -> bool | None:
         return None
 
 
-def write_session_state(state: str) -> None:
-    """Persist session liveness next to the cookie file (DrivePod gates its
-    harvester on it; tunester reads the browser UA from it). Atomic, so a
-    reader never sees a partial file."""
+def state_payload(state: str) -> str:
     payload = {"state": state, "ts": int(time.time())}
     if LIVE_UA is not None:
         payload["ua"] = LIVE_UA
-    try:
-        atomic_write(SESSION_STATE_PATH, json.dumps(payload) + "\n")
-    except OSError as exc:
-        log(f"session-state write failed: {exc}")
+    return json.dumps(payload) + "\n"
+
+
+def write_session_state(state: str) -> None:
+    """Persist session liveness next to the cookie file (DrivePod gates its
+    harvester on it; tunester reads the browser UA from it). Atomic, so a
+    reader never sees a partial file.
+
+    The payload is mirrored to every member partition's state file
+    unconditionally - unlike the jar, no consumer ever writes this file, and it
+    is the file their watchdogs judge liveness from: its mtime freezing is how a
+    dead exporter is detected, so a member whose only browser was removed has to
+    get the host's report or it would demand a chromium of its own forever.
+    """
+    text = state_payload(state)
+    paths = [SESSION_STATE_PATH] + COOKIE_SESSION_STATE_FANOUT
+    for path in paths:
+        try:
+            atomic_write(path, text)
+        except OSError as exc:
+            log(f"session-state write failed ({path}): {exc}")
+
+
+def fanout_jar(text: str) -> None:
+    """Mirror an accepted jar write to the member partitions' cookie files.
+
+    Each member's apps read their OWN COOKIES_FILE (that is what separates the
+    tenants), so the host's verified jar has to land there: with one browser per
+    vault, nothing else would ever refresh a member's jar. The same external-write
+    hold-off the primary write obeys is applied per path, so a member's in-flight
+    yt-dlp write-back is not clobbered; the next round retries it.
+    """
+    now = time.time()
+    for path in COOKIE_FANOUT_FILES:
+        try:
+            mtime = os.path.getmtime(path) if os.path.exists(path) else 0.0
+            if now - mtime < EXTERNAL_WRITE_COOLDOWN:
+                log(f"fan-out {path}: written externally {int(now - mtime)}s ago "
+                    f"(yt-dlp write-back?) - holding off")
+                continue
+            atomic_write(path, text)
+        except OSError as exc:
+            log(f"fan-out {path} failed: {exc}")
+
+
+def bootstrap_state() -> str:
+    """Liveness to publish on startup, instead of a blind 'unknown'.
+
+    'unknown' is what an exporter with no evidence can honestly say, and on a
+    vault that just gained its FIRST browser it is the wrong evidence: the file
+    has never been exported, so nothing is live, but 'unknown' is neither `up`
+    nor `down`, and only `down` arms auto_signin (the watchdog starts the family
+    on any non-`up` state, but nobody types the password until a reader sees
+    `down`). Probing decides which kind of unknown we are in:
+      - the file presents a session and the server accepts it  -> 'up'
+      - the server bounces it                                  -> 'down'
+      - the file presents nothing (never exported / empty)     -> 'down'
+      - the file has cookies but the probe could not answer    -> 'unknown'
+    """
+    alive = probe_file()
+    if alive is True:
+        return "up"
+    if alive is False:
+        return "down"
+    if file_cookie_header() is None:
+        return "down"
+    return "unknown"
 
 
 def _export_if_ok(cookies: list, reason: str) -> bool:
-    """Atomically write the jar to OUT_PATH. Returns False (and logs) while
-    the external-write cooldown is active."""
+    """Atomically write the jar to OUT_PATH, then fan the SAME text out to the
+    member partitions. Returns False (and logs) while the external-write
+    cooldown is active - and fans out only after a primary write succeeded, so
+    no member ever gets a jar the host did not accept."""
     mtime = os.path.getmtime(OUT_PATH) if os.path.exists(OUT_PATH) else 0
     if time.time() - mtime < EXTERNAL_WRITE_COOLDOWN:
         log(f"file modified externally {int(time.time()-mtime)}s ago (yt-dlp write-back?) - holding off {EXTERNAL_WRITE_COOLDOWN - int(time.time()-mtime)}s")
         return False
-    atomic_write(OUT_PATH, to_netscape(cookies))
+    text = to_netscape(cookies)
+    atomic_write(OUT_PATH, text)
+    fanout_jar(text)
     yt = sum(1 for c in cookies if "youtube.com" in (c.get("domain") or ""))
     log(f"cookies exported: {len(cookies)} total ({yt} youtube.com) [{reason}]")
     return True
@@ -808,6 +889,15 @@ def acquire_instance_lock() -> None:
         )
 
 
+def death_detail() -> str:
+    """The session_dead message: what to do about it depends on whether an auto
+    re-auth daemon is running at all (GOOGLE_PASSWORD configured)."""
+    if AUTO_SIGNIN:
+        return ("cookie file session killed by Google; auto re-auth in progress "
+                f"(manual fallback: {VNC_HINT})")
+    return f"cookie file session killed by Google; re-sign in via {VNC_HINT}"
+
+
 def main() -> None:
     acquire_instance_lock()
     channels = "+".join(
@@ -817,11 +907,20 @@ def main() -> None:
         f"starting: cdp={CDP_HOST}:{CDP_PORT} out={OUT_PATH} "
         f"poll={POLL_SECONDS}s probe={SESSION_PROBE_INTERVAL}s notify={channels}"
     )
-    write_session_state("unknown")
-    last_fp = None
-    state = "unknown"  # liveness of the FILE's session: unknown | up | down
+    # First report. A vault that has never exported has NOTHING live to offer
+    # its consumers, and `down` is what arms auto_signin and tells the watchdog
+    # this account needs its browser; publishing `unknown` instead let a fresh
+    # vault look "still deciding" for a whole probe interval.
+    state = bootstrap_state()
+    write_session_state(state)
+    if state == "down":
+        log("SESSION DOWN at startup (no live session in the cookie file)")
+        notify("session_dead", death_detail())
+    elif state == "up":
+        log("SESSION UP at startup (file session live)")
     state_since = time.time()
-    last_probe = 0.0
+    last_probe = time.time()   # bootstrap_state() just ran the same probe
+    last_fp = None
     last_confirm = 0.0
     prev_jar_login: bool | None = None  # jar login state at last probe
     ua_synced = False
@@ -879,18 +978,7 @@ def main() -> None:
                             f"SESSION DEAD (file session killed; "
                             f"was '{state}' since {since} UTC)"
                         )
-                        if AUTO_SIGNIN:
-                            detail = (
-                                "cookie file session killed by Google; auto "
-                                f"re-auth in progress (manual fallback: "
-                                f"{VNC_HINT})"
-                            )
-                        else:
-                            detail = (
-                                "cookie file session killed by Google; re-sign "
-                                f"in via {VNC_HINT}"
-                            )
-                        notify("session_dead", detail)
+                        notify("session_dead", death_detail())
                         state, state_since = "down", time.time()
                     if cookies is not None:
                         if jar_login and _export_if_ok(

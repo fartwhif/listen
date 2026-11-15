@@ -12,10 +12,15 @@ Two jobs, one process, two cadences:
    mistake leaves nginx serving the last good config (and says so every scan)
    instead of failing to start on the next container restart.
 
-2. Vaults (every HUB_VAULT_SCAN s). Chromium runs only while a partition's
-   cookie session is actually unusable, and stops as soon as it is usable
-   again. platform/vault-run.py is the inner decider and normally exits by
-   itself; what the watchdog owns that vault-run structurally cannot:
+2. Vaults (every HUB_VAULT_SCAN s). Chromium runs only while a session is
+   actually unusable, and stops as soon as it is usable again - ONE family per
+   VAULT, never one per partition (gen-conf `vault_hosts`): a vault id is a
+   Google account, and several partitions may name it. Liveness is therefore
+   judged from the vault HOST's files - its exporter is the only writer of `up`
+   for that account, and its fan-out is what keeps every member's jar and state
+   file fresh, so a member with no browser of its own is still served.
+   platform/vault-run.py is the inner decider and normally exits by itself;
+   what the watchdog owns that vault-run structurally cannot:
      - STARTING the family when a session goes stale - the exporter can only
        report the problem, and supervisor cannot act on the contents of a file;
      - STOPPING a family that is stuck RUNNING with a live session (the idle
@@ -136,7 +141,12 @@ def apply_registry() -> bool:
 
 # ------------------------------------------------------------------- sessions
 def session_live(slug: str, now: float) -> tuple[bool, str]:
-    """(usable, reason). See the module docstring for why every age counts."""
+    """(usable, reason) for the session files under partition `slug`'s home.
+
+    Scan the partition named: for a shared vault that is the vault HOST, whose
+    exporter is the only writer of `up` for the account and whose fan-out keeps
+    every member's copy inside the age limits (see scan_vaults).
+    """
     home = f"{DATA}/users/{slug}"
     try:
         cookie_age = now - os.stat(f"{home}/cookies.txt").st_mtime
@@ -177,18 +187,29 @@ class Attempt:
 
 
 def scan_vaults(reg: dict, now: float, attempts: dict[str, Attempt]) -> None:
-    for slug in reg["slugs"]:
-        name = f"vault-{slug}"
-        st = attempts.setdefault(slug, Attempt())
-        live, why = session_live(slug, now)
+    """Start/stop ONE browser family per vault (gen_conf.vault_hosts).
+
+    Keyed by VAULT id, not slug: `vault: "owner"` on three partitions is one
+    Google account, and one family per partition is two chromiums re-typing the
+    same password and two exporters fighting over the rotated jar. Liveness is
+    judged from the HOST partition's files, which is exactly right for a shared
+    vault: the host's exporter is the only writer of `up` for this account, and
+    its fan-out is what keeps every member's jar and state file inside MAX_AGE -
+    so a member whose own browser no longer exists still counts as served.
+    """
+    for vault, host in gen_conf.vault_hosts(reg).items():
+        name = f"vault-{vault}"
+        st = attempts.setdefault(vault, Attempt())
+        live, why = session_live(host, now)
         state, uptime = program_state(name)
         running = state in ("RUNNING", "STARTING", "STOPPING")
 
         if running:
             st.running = True
             if state == "RUNNING" and live and uptime > IDLE:
-                log(f"{name}: {why} but the family has been up {int(uptime)}s "
-                    f"> idle {IDLE}s; stopping it (vault-run did not exit)")
+                log(f"{name}: {why} (host {host}) but the family has been up "
+                    f"{int(uptime)}s > idle {IDLE}s; stopping it "
+                    f"(vault-run did not exit)")
                 ctl("stop", name)
             continue
 
@@ -209,10 +230,10 @@ def scan_vaults(reg: dict, now: float, attempts: dict[str, Attempt]) -> None:
         delay = st.backoff()
         since = now - st.last_start
         if st.last_start and since < delay:
-            log(f"{slug}: {why}; retry in {int(delay - since)}s "
+            log(f"{name}: {why}; retry in {int(delay - since)}s "
                 f"(backoff after {st.failures} failure(s))")
             continue
-        log(f"{slug}: {why}; starting {name}")
+        log(f"{name}: {why}; starting (host {host})")
         r = ctl("start", name)
         if r.returncode:
             log(f"{name}: start failed: {r.stdout.strip() or r.stderr.strip()}")
@@ -240,7 +261,9 @@ def main() -> int:
         except Exception as exc:
             log(f"registry unreadable: {exc!r}")
             reg = {"slugs": []}
-        for gone in [s for s in attempts if s not in reg["slugs"]]:
+        # attempts are keyed by VAULT (scan_vaults), so a retired slug only
+        # clears its backoff once no partition names that vault any more.
+        for gone in [v for v in attempts if v not in gen_conf.vault_hosts(reg)]:
             attempts.pop(gone)
         now = time.time()
         if now - last_scan >= SCAN_INTERVAL:

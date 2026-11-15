@@ -43,9 +43,11 @@ the same filesystem would make it a 41 GB copy (see Gotchas).
 <state>/hub.db                       users, memberships, sessions, pair codes
 <state>/partitions.json              the registry: the ONLY partition config
 <state>/pool/{out,cache,nzb-cache,jobs,blobs}   shared tuner pool + blob store
-<state>/vaults/<vault>/profiles/<slug>/          chromium profile (per partition)
+<state>/vaults/<vault>/                        one Google account: profile root
+<state>/vaults/<vault>/profiles/<slug>/          per-partition chromium profile
 <state>/users/<slug>/cache/          media (DrivePod library, GrabbyTube harvests)
-<state>/users/<slug>/cookies.txt     that partition's vault export
+<state>/users/<slug>/cookies.txt     this partition's jar (a shared vault's comes
+                                     from the vault host's browser, by fan-out)
 <state>/users/<slug>/{radio,library}/            radio state, tuned catalog
 <state>/users/<slug>/{grabbytube.db,database.db} per-partition databases
 ```
@@ -76,12 +78,28 @@ unaffected. Ten partitions max: the port map is arithmetic.
                 "quota": { "concurrentDownloads": 1 } } } }
 ```
 
-`"vault": "owner"` means *this partition shares owner's Google account and
-cookie jar*; each partition still gets its **own chromium profile** (two
+`"vault": "owner"` means *this partition signs in as owner's Google account*. A
+vault id is an **account**, not a partition, so it gets **one** browser family:
+supervisor program `vault-<vault>`, run by the **host** — the first partition in
+slug order naming that vault. Every other partition on it gets the app programs,
+its own chromium **profile** under `vaults/<vault>/profiles/<slug>/` (two
 chromiums on one profile dir fight over the `SingletonLock`) and its own
-`cookies.txt` export. `mode: shared` allows several members; `single` pins the
-partition to one user. `quota.concurrentDownloads` caps that partition's
-concurrent tuner jobs, so one member's queue cannot starve another's.
+`cookies.txt`, which the host's exporter **fans out** to — along with its
+`session-state.json`, so a member's watchdog keeps seeing the account's real
+liveness with no browser of its own. That is the whole reason for the dedup: two
+chromiums authenticating as one account each re-type the password and each
+rotate the jar the other's yt-dlp write-backs maintain. `mode: shared` allows
+several members; `single` pins the partition to one user.
+`quota.concurrentDownloads` caps that partition's concurrent tuner jobs, so one
+member's queue cannot starve another's.
+
+A second Google account is a **second vault id plus credentials on its host
+partition**: `"settings": { "GOOGLE_EMAIL": "<account>@example.com",
+"GOOGLE_PASSWORD": "…" }` on the partition that hosts that vault (the first in
+slug order naming it). The registry wins over `.env`, and any name the settings
+do not carry falls back to `.env` — so `GOOGLE_EMAIL`/`GOOGLE_PASSWORD` in `.env`
+is the one-account-per-box default, and two vault ids sharing it would run two
+browsers on one account, which is exactly the fight the dedup exists to prevent.
 
 ## Path contract
 
@@ -124,6 +142,13 @@ docker compose exec listen hub vault logs family --lines 200
 docker compose exec listen hub partition default owner
 docker compose exec listen hub reload                       # force re-read
 ```
+
+`hub vault <verb> <slug>` addresses the **account** that slug signs in as, so on
+a shared vault it starts/stops/logs the host's one family — and prints which host
+it touched plus every partition that shares it. `restart family` when `family`
+signs in as `owner` restarts `vault-owner`. `hub partition list` labels each line
+`(browser)` or `(via <host>)` for the same reason, and `partition rm`/`set
+--vault` say where a vault's browser moved when its host goes away.
 
 Devices pair at `/pair`: mint a code, type it on the device, it gets a session
 cookie bound to that partition. Users are global, sessions are per partition; a
@@ -177,10 +202,14 @@ source).
 - **`docker exec` with a stray env**: a shell inside the container does not
   inherit a tenant's `environment=` block, so run app code through the
   supervised process or via its HTTP API, not `docker exec … python app.py`.
-- **Chromium is started on demand** (`autostart=false`): a healthy partition
-  runs zero chromium. If the vault seems dead, it usually means it is idle; `hub
-  vault status <slug>` says why, and the watchdog starts it when
-  `cookies.txt` goes stale (`HUB_VAULT_MAX_AGE`).
+- **Chromium is started on demand** (`autostart=false`), and **once per vault,
+  not per partition**: a healthy box runs zero chromium, and two tenants sharing
+  a Google account share one browser family (`vault-<vault>`, the host partition,
+  see the registry section). If a vault seems dead it is usually just idle; `hub
+  vault status <slug>` says why from the HOST's files (a member is never asked
+  for a browser of its own, so a member with no files of its own still counts as
+  live), and the watchdog starts the family when the jar goes stale
+  (`HUB_VAULT_MAX_AGE`).
 - **The tuner is shared.** Two partitions asking for the same verified rip get
   one download and one blob (`<state>/pool/blobs/<sha256>.mp3`) delivered as a
   hardlink into each cache; a file any partition then rewrites detaches its own

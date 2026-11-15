@@ -179,11 +179,14 @@ def env_of(block):
 
 def test_supervisor_conf_programs_per_partition(two):
     blocks = program_blocks(gen.supervisor_conf(two))
+    # ONE vault program for the whole registry: both partitions here name vault
+    # "owner", and a vault id is a Google account, so `vault-family` must not
+    # exist - two chromiums re-typing one password is the bug that dedup fixes.
     assert sorted(blocks) == sorted([
         "bgutil", "hubauth", "nginx", "streamfix", "tunester", "watchdog",
-        "drivepod-owner", "grabbytube-owner", "frogrock-owner", "vault-owner",
+        "drivepod-owner", "grabbytube-owner", "frogrock-owner",
         "drivepod-family", "grabbytube-family", "frogrock-family",
-        "vault-family"])
+        "vault-owner"])
     # radio False must remove the broadcaster, not just its port.
     two["partitions"]["family"]["radio"] = False
     assert "frogrock-family" not in program_blocks(gen.supervisor_conf(two))
@@ -199,13 +202,18 @@ def test_supervisor_conf_programs_per_partition(two):
 
 def test_vault_programs_are_manual_start(two):
     blocks = program_blocks(gen.supervisor_conf(two))
-    for slug in ("owner", "family"):
-        b = blocks[f"vault-{slug}"]
+    # Named after the VAULT, and one per distinct vault: the program drives one
+    # Google account's browser, so two partitions sharing vault "owner" get one
+    # program between them (see test_vault_programs_are_named_after_the_vault).
+    for vault in gen.vault_hosts(two):
+        b = blocks[f"vault-{vault}"]
         # autostart/autorestart false is the owner's invariant: no chromium
         # until a session is actually stale. The watchdog owns the life.
         assert "autostart=false" in b and "autorestart=false" in b
-        assert f"python3 /srv/stack/platform/vault-run.py {slug}" in b
-        assert f"stdout_logfile=/var/log/sup/vault-{slug}.log" in b
+        # The host partition is the argument: vault-run.py derives the profile
+        # dir and the fan-out targets from it, and only the host has a browser.
+        assert f"python3 /srv/stack/platform/vault-run.py {vault}" in b
+        assert f"stdout_logfile=/var/log/sup/vault-{vault}.log" in b
     assert "autostart=true" in blocks["drivepod-owner"]
     # QUIT, not TERM: a graceful nginx drains the listeners mid-stream.
     assert "stopsignal=QUIT" in blocks["nginx"]
@@ -347,6 +355,189 @@ def test_vault_env_gets_push_targets_and_door(two, monkeypatch):
         assert vault[key] == tenant[key], key
 
 
+def _with_index(reg: dict) -> dict:
+    """load_registry's per-spec fill-in (index, vault_slug, defaults) for a
+    registry a test builds by hand instead of reading from a file."""
+    out = {"slugs": list(reg["slugs"]), "front": reg.get("defaultSlug"),
+           "partitions": {}}
+    for i, slug in enumerate(out["slugs"]):
+        spec = dict(reg["partitions"][slug])
+        spec["index"] = i
+        spec.setdefault("mode", "single")
+        spec.setdefault("name", slug.capitalize())
+        spec.setdefault("owner", "owner")
+        spec.setdefault("radio", True)
+        spec["vault_slug"] = spec.get("vault") or slug
+        spec.setdefault("quota", {})
+        spec.setdefault("settings", {})
+        out["partitions"][slug] = spec
+    return out
+
+
+def test_vault_programs_are_named_after_the_vault_not_the_partition(two):
+    """The dedup itself: a vault id is a GOOGLE ACCOUNT, so two partitions
+    naming it get ONE browser family, and it is named for the vault.
+
+    Named after the partition (what this generator used to do), removing the
+    host - or renaming which partition hosts it - orphans vaults/<vault>/: the
+    program vanishes with the name it carried while the profile and jar stay on
+    disk for an account the survivors still sign in as.
+    """
+    blocks = program_blocks(gen.supervisor_conf(two))
+    assert blocks.get("vault-family") is None
+    # Take the naming partition away: the vault keeps its name and its program,
+    # and the surviving member that still names it becomes the host (the
+    # argument to vault-run.py), because the profile has to belong to somebody
+    # supervision can start.
+    reg = {"slugs": ["family"], "defaultSlug": "family",
+           "partitions": {"family": dict(two["partitions"]["family"],
+                                         vault="owner")}}
+    blocks2 = program_blocks(gen.supervisor_conf(_with_index(reg)))
+    assert "vault-owner" in blocks2 and "vault-family" not in blocks2
+    assert "python3 /srv/stack/platform/vault-run.py family" \
+        in blocks2["vault-owner"]
+    assert gen.vault_hosts(two) == {"owner": "owner"}
+
+
+def test_two_accounts_get_two_vault_programs(two):
+    """The other half: the dedup is per VAULT, not global. Two Google accounts
+    in one box are two browsers, each with its own program, ports and profile -
+    sharing is one browser per ACCOUNT, not one browser per box."""
+    reg = json.loads(json.dumps(two))
+    reg["partitions"]["family"]["vault"] = "kidacct"
+    reg = _with_index(reg)
+    blocks = program_blocks(gen.supervisor_conf(reg))
+    assert sorted(n for n in blocks if n.startswith("vault-")) == [
+        "vault-kidacct", "vault-owner"]          # the two vault ids
+    assert "vault-run.py family" in blocks["vault-kidacct"]
+    # Each family dials its OWN browser ports: two chromiums on one host cannot
+    # share an X display, a VNC port, a websockify or a CDP port.
+    for name, slug in (("vault-owner", "owner"), ("vault-kidacct", "family")):
+        e = env_of(blocks[name])
+        p = gen.ports(reg["partitions"][slug]["index"])
+        assert e["VNC_PORT"] == str(p["vnc"]) and e["CDP_PORT"] == str(p["cdp"])
+        assert e["WEBSOCKIFY_PORT"] == str(p["ws"])
+        assert e["VAULT_SLUG"] == reg["partitions"][slug]["vault_slug"]
+        assert e["VAULT_DIR"] == f"{gen.DATA}/vaults/{e['VAULT_SLUG']}"
+        # Two chromiums, one profile dir each: sharing the directory is a
+        # SingletonLock fight and "profile is already in use".
+        assert e["VAULT_PROFILE_DIR"] == \
+            f"{gen.DATA}/vaults/{e['VAULT_SLUG']}/profiles/{slug}"
+    assert gen.vault_hosts(reg) == {"owner": "owner", "kidacct": "family"}
+
+
+def test_two_accounts_get_their_own_credentials(two, monkeypatch):
+    """`settings.GOOGLE_EMAIL` IS the account a vault signs in as, so it has to
+    reach `vault-<id>` and not the container's single `.env` account. With the
+    precedence reversed every browser authenticates the `.env` account while each
+    partition's apps read a DIFFERENT jar - a wrong-session box that still looks
+    healthy from the outside (handshake up, jar fresh, just somebody else's).
+
+    `.env` stays the fallback, which is the one-account-per-box shape that
+    test_credentials_are_forwarded_only_when_set covers.
+    """
+    monkeypatch.setenv("GOOGLE_EMAIL", "env-account@example.com")
+    monkeypatch.setenv("GOOGLE_PASSWORD", "envpass")
+    reg = json.loads(json.dumps(two))
+    reg["partitions"]["owner"]["settings"] = {
+        "GOOGLE_EMAIL": "home@example.com", "GOOGLE_PASSWORD": "homepass"}
+    reg["partitions"]["family"]["vault"] = "kidacct"
+    reg["partitions"]["family"]["settings"] = {"GOOGLE_EMAIL": "kid@example.com"}
+    blocks = program_blocks(gen.supervisor_conf(_with_index(reg)))
+    assert env_of(blocks["vault-owner"])["GOOGLE_EMAIL"] == "home@example.com"
+    assert env_of(blocks["vault-owner"])["GOOGLE_PASSWORD"] == "homepass"
+    assert env_of(blocks["vault-kidacct"])["GOOGLE_EMAIL"] == "kid@example.com"
+    # A name settings does NOT carry still falls back to `.env`: a second account
+    # that shares the box's password must not lose it.
+    assert env_of(blocks["vault-kidacct"])["GOOGLE_PASSWORD"] == "envpass"
+
+
+def test_vault_env_fans_writes_out_to_every_member(two):
+    """The other half of one-browser-per-vault: a member's apps read their OWN
+    COOKIES_FILE (that is what separates tenants), so the host's exporter has
+    to write there too, or a member's jar ages out with no browser of its own.
+
+    The HOST's own paths are not in the lists: it keeps writing them the way it
+    always did, and listing them twice would give one process two writers of
+    the same file.
+    """
+    v = env_of(program_blocks(gen.supervisor_conf(two))["vault-owner"])
+    data = gen.DATA
+    assert v["COOKIE_FANOUT_FILES"] == f"{data}/users/family/cookies.txt"
+    assert v["COOKIE_SESSION_STATE_FANOUT"] == \
+        f"{data}/users/family/session-state.json"
+    assert v["COOKIES_FILE"] not in v["COOKIE_FANOUT_FILES"].split(",")
+    assert v["COOKIE_SESSION_STATE"] not in \
+        v["COOKIE_SESSION_STATE_FANOUT"].split(",")
+    # companion_paths is what renders these; it must agree with the env exactly.
+    assert gen.companion_paths(two, "owner") == {
+        "cookies": [f"{data}/users/family/cookies.txt"],
+        "state": [f"{data}/users/family/session-state.json"]}
+    # A vault with no members gets the keys OMITTED, not empty: the exporter's
+    # standalone deploy has no companions, and an empty quoted value in a
+    # generated file reads like a path that went missing.
+    solo = _with_index({"slugs": ["owner"], "defaultSlug": "owner",
+                        "partitions": {"owner": {"vault": "owner"}}})
+    solo_env = env_of(program_blocks(gen.supervisor_conf(solo))["vault-owner"])
+    assert "COOKIE_FANOUT_FILES" not in solo_env
+    assert "COOKIE_SESSION_STATE_FANOUT" not in solo_env
+    assert gen.companion_paths(solo, "owner") == {"cookies": [], "state": []}
+    # Members of ANOTHER vault are not this vault's companions.
+    reg = json.loads(json.dumps(two))
+    reg["partitions"]["family"]["vault"] = "kidacct"
+    assert gen.companion_paths(_with_index(reg), "owner") == {
+        "cookies": [], "state": []}
+
+
+def test_a_member_door_proxies_the_vault_hosts_websocket(two):
+    """No chromium runs for a member, so its noVNC door has to reach the HOST's
+    websockify (owner's ws port), while the mount and the gate stay the member's
+    own: one shared browser, one door per partition.
+
+    Proxying a member's door to the member's own (now non-existent) websockify
+    is the failure mode the dedup introduces, and it fails only when the user
+    actually opens the door - after the sign-in worked.
+    """
+    body = gen.nginx_locations(two)
+    doors = {n: b for n, b in locations(body) if n and n.endswith("/vnc/websockify")}
+    assert sorted(doors) == ["/l/family/vnc/websockify", "/l/owner/vnc/websockify",
+                             "/vnc/websockify"]
+    host_ws = gen.ports(two["partitions"]["owner"]["index"])["ws"]
+    member_ws = gen.ports(two["partitions"]["family"]["index"])["ws"]
+    for name in ("/l/family/vnc/websockify", "/vnc/websockify"):
+        m = re.search(r"proxy_pass http://127\.0\.0\.1:(\d+)", doors[name])
+        assert int(m.group(1)) == host_ws, (name, m.group(0))
+    m = re.search(r"proxy_pass http://127\.0\.0\.1:(\d+)",
+                  doors["/l/owner/vnc/websockify"])
+    assert int(m.group(1)) == host_ws != member_ws
+    # The gate is still the MEMBER's: the door serves whoever is signed in to
+    # that partition, not whoever hosts the browser.
+    assert "auth_request /_gate/family;" in doors["/l/family/vnc/websockify"]
+    # Only the door follows the vault: the member's api and grabby mounts stay
+    # on the member's own ports.
+    locs = dict(locations(body))
+    assert f"http://127.0.0.1:{gen.ports(1)['drivepod']}" in locs["/l/family/api/"]
+    assert f"http://127.0.0.1:{gen.ports(1)['grabby']}" in \
+        locs["/l/family/grabby/"]
+
+
+def test_picker_names_the_vault_and_says_who_holds_the_browser(two):
+    """Two partitions signing in as the SAME Google account is a different
+    choice from two accounts, and the picker is the only place a user makes it:
+    the card names the vault and says which partition's browser a sign-in runs
+    in, because starting it there serves the other card too."""
+    picker = gen.picker_html(two)
+    assert "vault owner" in picker
+    assert "sign-in host for 1 other" in picker
+    assert "signs in via /owner" in picker
+    # Two accounts: no card claims anything about the other one.
+    reg = json.loads(json.dumps(two))
+    reg["partitions"]["family"]["vault"] = "kidacct"
+    sep = gen.picker_html(_with_index(reg))
+    assert "sign-in host" not in sep and "signs in via" not in sep
+    assert "vault owner" in sep and "vault kidacct" in sep
+
+
 # ----------------------------------------------------------------- nginx
 LOC_RE = re.compile(
     r"^\s*(location)\s+(?P<kind>=|~\*|\^~|~|@)?\s*(?P<name>\S+)?\s*\{(?P<body>.*?^\})\n",
@@ -468,6 +659,7 @@ def test_every_partition_path_is_gated(two):
 
 def test_locations_use_literal_ports_for_the_right_partition(two):
     body = gen.nginx_locations(two)
+    hosts = gen.vault_hosts(two)
     for name, block in locations(body):
         m = re.search(r"proxy_pass http://127\.0\.0\.1:(\d+)(/?)", block)
         if not m:
@@ -480,6 +672,11 @@ def test_locations_use_literal_ports_for_the_right_partition(two):
         if port in (8099, 8102):
             continue                      # hubauth and the shared pool
         slug = mslug.group(1) if mslug else two["front"]
+        if "/vnc/" in (name or ""):
+            # The door follows the VAULT, not the mount: a member's noVNC has to
+            # reach the ONE browser its Google account owns, and a member that
+            # shares a vault has no websockify of its own to reach.
+            slug = hosts[two["partitions"][slug]["vault_slug"]]
         expected = set(gen.ports(two["partitions"][slug]["index"]).values())
         assert port in expected, f"{name}: port {port} is not {slug}'s"
 
@@ -762,14 +959,21 @@ def test_main_survives_a_partition_add(gen_conf_dirs):
     # The default registry the fixture seeds is front=owner only; add family.
     reg = json.loads(roots["registry"].read_text())
     reg["slugs"].append("family")
+    # `vault: "owner"` is the point of this registry: family signs in as the
+    # front partition's Google account, so it gets no browser of its own.
     reg["partitions"]["family"] = {"mode": "shared", "name": "Family",
-                                   "owner": "owner"}
+                                   "owner": "owner", "vault": "owner"}
     roots["registry"].write_text(json.dumps(reg, indent=2))
     assert roots["gen"].main() == 0
     body = (roots["etc"] / "nginx/stack-locations/10-locations.conf").read_text()
     assert "location /l/family/api/" in body
     sup = (roots["etc"] / "supervisor/conf.d/stack-programs.conf").read_text()
-    assert "[program:vault-family]" in sup and "[program:frogrock-family]" in sup
+    # family names vault "owner", the same account the front partition signs in
+    # as, so it gets the app programs but NO vault program of its own: the one
+    # vault-owner family already serves it (see the dedup tests below).
+    assert ("[program:drivepod-family]" in sup
+            and "[program:frogrock-family]" in sup)
+    assert "[program:vault-family]" not in sup
     assert (roots["spa"] / "l/family/index.html").read_text().count(
         '<base href="/l/family/">') == 1
 

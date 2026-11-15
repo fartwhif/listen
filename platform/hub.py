@@ -49,6 +49,31 @@ def save_registry(reg: dict) -> None:
     os.replace(tmp, REGISTRY)
 
 
+def vault_of(reg: dict, slug: str) -> tuple[str, str]:
+    """(vault id, host partition) for the vault `slug` signs in with.
+
+    Supervisor programs are named after the VAULT (platform/gen-conf.py
+    vault_hosts), because one vault id is one Google account and only one browser
+    family may serve it. So `hub vault start kid` for a partition that shares
+    vault "owner" has to talk to program `vault-owner` - and the operator has to
+    see that this starts sign-in for every partition named on that vault, not for
+    `kid` alone.
+
+    Mirrors gen-conf's rule (first partition in slug order naming the vault is
+    the host) rather than importing it: gen-conf.py's hyphenated name is not an
+    importable module, and this copy is three lines with a test pinning that both
+    agree. Unknown slug -> the slug as its own vault, which is what the registry
+    itself defaults to, so supervisorctl's own "no such process" is the answer.
+    """
+    parts = reg.get("partitions", {})
+    spec = parts.get(slug) or {}
+    vault = spec.get("vault") or slug
+    for s in reg.get("slugs", []):
+        sp = parts.get(s) or {}
+        if (sp.get("vault") or s) == vault:
+            return vault, s
+    return vault, slug
+
 def ctl(*args: str) -> int:
     """supervisorctl, so vault start/stop goes through the same supervisor that
     supervises everything else (logs, respawn policy, one place to look)."""
@@ -200,6 +225,10 @@ def cmd_partition(a) -> int:
         if a.slug in slugs:
             print(f"hub: {a.slug} already exists", file=sys.stderr)
             return 1
+        if a.vault and not SLUG_RE.match(a.vault):
+            print(f"hub: bad vault id {a.vault!r} - a vault id becomes a path "
+                  f"segment and a supervisor program name", file=sys.stderr)
+            return 1
         spec = {"mode": a.mode, "name": a.name or a.slug.capitalize(),
                 "owner": a.owner, "radio": not a.no_radio,
                 "vault": a.vault or a.slug}
@@ -218,36 +247,91 @@ def cmd_partition(a) -> int:
             conn.close()
         reg["defaultSlug"] = reg.get("defaultSlug") or a.slug
         save_registry(reg)
-        print(f"hub: partition {a.slug} added; the watchdog reloads within ~10s")
+        # A vault id is a Google account, and the account gets ONE browser
+        # (platform/gen-conf.py vault_hosts). Say so when the new partition lands
+        # on an account somebody already named: the operator who adds `kid`
+        # expecting a browser of its own otherwise waits for a chromium that is
+        # never started, and `hub vault start kid` in fact drives alpha's.
+        vault = spec["vault"]
+        siblings = [s for s in slugs if s != a.slug
+                    and vault_of(reg, s)[0] == vault]
+        if siblings:
+            host = vault_of(reg, a.slug)[1]
+            print(f"hub: partition {a.slug} added; it signs in as vault {vault} "
+                  f"with {', '.join(siblings)}, so ONE browser (on {host}) serves "
+                  f"all of them - no sign-in is needed here")
+        else:
+            print(f"hub: partition {a.slug} added; the watchdog reloads within ~10s")
     elif a.action == "rm":
         if a.slug not in slugs:
             print(f"hub: no such partition {a.slug}", file=sys.stderr)
             return 1
+        vault, was_host = vault_of(reg, a.slug)
+        rest = [s for s in slugs if s != a.slug]
+        after = {"slugs": rest, "partitions": {k: parts[k] for k in rest}}
+        # gen-conf's rule on the registry as it will be: whoever still names this
+        # vault becomes its browser host, or nobody does.
+        inherits = next((s for s in rest if vault_of(after, s)[0] == vault),
+                        None)
         slugs.remove(a.slug)
         parts.pop(a.slug, None)
         if reg.get("defaultSlug") == a.slug:
             reg["defaultSlug"] = slugs[0] if slugs else None
         save_registry(reg)
+        data = os.environ.get("HUB_DATA_DIR", "/data")
         print(f"hub: partition {a.slug} removed. Its data under "
-              f"{os.environ.get('HUB_DATA_DIR', '/data')}/users/{a.slug} and "
-              f"vaults/{a.slug} is left in place; delete it by hand if you mean it.")
+              f"{data}/users/{a.slug} and vaults/{a.slug} is left in place; "
+              f"delete it by hand if you mean it.")
+        if was_host:
+            if inherits:
+                print(f"     vault {vault} moves to {inherits}, which still names "
+                      f"it: its browser starts there on the next reload")
+            else:
+                print(f"     no partition left names vault {vault}: nothing "
+                      f"supervises vaults/{vault} now")
     elif a.action == "set":
         spec = parts.get(a.slug)
         if spec is None:
             print(f"hub: no such partition {a.slug}", file=sys.stderr)
             return 1
+        if a.vault is not None and not SLUG_RE.match(a.vault):
+            print(f"hub: bad vault id {a.vault!r} - a vault id becomes a path "
+                  f"segment and a supervisor program name", file=sys.stderr)
+            return 1
         pairs = setting_pairs(a)
-        if not pairs:
+        if not pairs and a.vault is None:
             print(f"hub: nothing to set for {a.slug}; pass KEY=VALUE "
-                  f"(positionals or --set)", file=sys.stderr)
+                  f"(positionals or --set) or --vault <id>", file=sys.stderr)
             return 1
         refusals = apply_settings(spec, pairs)
         if refusals:
             for m in refusals:
                 print(f"hub: refusing setting {m}", file=sys.stderr)
             return 1
+        moved = None
+        if a.vault is not None and (spec.get("vault") or a.slug) != a.vault:
+            old, was_host = vault_of(reg, a.slug)
+            spec["vault"] = a.vault
+            moved = (old, was_host, vault_of(reg, a.slug))
+        elif a.vault is not None:
+            spec["vault"] = a.vault       # same vault, stated explicitly
         save_registry(reg)
-        print(f"hub: settings updated for {a.slug}")
+        if moved:
+            old, was_host, (new, new_host) = moved
+            print(f"hub: {a.slug} now signs in as vault {new} (browser on "
+                  f"{new_host}); its own cookies under users/{a.slug} keep "
+                  f"serving it until that vault's browser exports over them")
+            if was_host:
+                still = [s for s in slugs if s != a.slug
+                         and (parts[s].get("vault") or s) == old]
+                if still:
+                    print(f"     vault {old} moves to {still[0]}, which still "
+                          f"names it: its browser starts there on the next reload")
+                else:
+                    print(f"     no partition left names vault {old}: nothing "
+                          f"supervises vaults/{old} now")
+        else:
+            print(f"hub: settings updated for {a.slug}")
     elif a.action == "default":
         if a.slug not in slugs:
             print(f"hub: no such partition {a.slug}", file=sys.stderr)
@@ -258,10 +342,19 @@ def cmd_partition(a) -> int:
     else:
         print(f"slugs: {', '.join(slugs) or '(none)'}")
         print(f"front: {reg.get('defaultSlug')}")
+        hosts: dict = {}
+        for s in slugs:
+            hosts.setdefault(parts[s].get("vault") or s, s)
         for s in slugs:
             sp = parts[s]
+            vault = sp.get("vault") or s
+            # The browser for a vault lives on ONE partition (gen-conf
+            # vault_hosts); the rest get their cookies by fan-out. Say which is
+            # which, because `hub vault start <slug>` follows this line.
+            who = " (browser)" if hosts[vault] == s else f" (via {hosts[vault]})"
             print(f"  {s:12} {sp.get('mode','single'):7} radio="
-                  f"{'yes' if sp.get('radio', True) else 'no ':3} vault={sp.get('vault', s)}"
+                  f"{'yes' if sp.get('radio', True) else 'no ':3} "
+                  f"vault={vault}{who}"
                   f" name={sp.get('name', s)}")
     return 0
 
@@ -282,23 +375,49 @@ def cmd_code(a) -> int:
 
 
 def cmd_vault(a) -> int:
-    slug = a.slug
+    """Vault control, addressed by any partition that uses the vault.
+
+    `hub vault start kid` is the natural thing to type, and it means "get this
+    account signed in", so it resolves to the vault's program (vault_of). Because
+    one vault may serve several partitions, every action says which vault it
+    acted on and which partitions share it - otherwise a start for one looks like
+    a start for one.
+    """
+    reg = registry()
+    vault, host = vault_of(reg, a.slug)
+    name = f"vault-{vault}"
+    members = [s for s in reg.get("slugs", [])
+               if vault_of(reg, s)[0] == vault]
     if a.action == "status":
-        return ctl("status", f"vault-{slug}")
+        rc = ctl("status", name)
+        _vault_note(vault, host, members)
+        return rc
     if a.action == "logs":
         logs = os.environ.get("HUB_VAULT_LOG_DIR", "/var/log/sup")
-        path = os.path.join(logs, f"vault-{slug}.log")
+        path = os.path.join(logs, f"{name}.log")
         try:
             with open(path) as fh:
                 sys.stdout.write("".join(fh.readlines()[-int(a.lines):]))
         except OSError as exc:
             print(f"hub: {exc}", file=sys.stderr)
             return 1
+        _vault_note(vault, host, members)
         return 0
     if a.action in ("start", "stop", "restart"):
-        return ctl(a.action, f"vault-{slug}")
+        rc = ctl(a.action, name)
+        _vault_note(vault, host, members)
+        return rc
     print("hub vault: unknown action", file=sys.stderr)
     return 1
+
+
+def _vault_note(vault: str, host: str, members: list) -> None:
+    """Say which vault was touched and who else depends on it."""
+    if len(members) > 1:
+        print(f"hub: vault {vault} (browser on {host}) serves {', '.join(members)}"
+              f" - one sign-in covers all of them")
+    elif members and members[0] != host:
+        print(f"hub: vault {vault} is named by {host}; no partition owns it")
 
 
 def cmd_reload(a) -> int:

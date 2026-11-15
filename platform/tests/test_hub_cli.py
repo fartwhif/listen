@@ -106,3 +106,114 @@ def test_missing_slug_still_fails(hub_env, monkeypatch):
     hub, _ = hub_env
     assert run(hub, monkeypatch,
                ["partition", "set", "ghost", "--set", "A=1"]) == 1
+
+
+# ------------------------------------------------------------------ vault hosts
+def test_vault_of_names_the_host_partition_not_the_slug(hub_env, monkeypatch):
+    """`hub vault start kid` means "get this ACCOUNT signed in", and the account
+    has ONE browser program (vault-<vault>, run by the host partition).
+
+    Resolving it to the typed slug is what the pre-dedup CLI did, and after the
+    dedup that program does not exist for a member: supervisorctl answers
+    "no such process" for a partition whose account is signed in elsewhere,
+    which reads like a broken vault rather than a shared one.
+    """
+    hub, registry = hub_env
+    run(hub, monkeypatch, ["partition", "add", "alpha", "--owner", "owner"])
+    run(hub, monkeypatch, ["partition", "add", "kid", "--vault", "alpha",
+                           "--owner", "owner"])
+    reg = json.loads(registry.read_text())
+    assert hub.vault_of(reg, "kid") == ("alpha", "alpha")
+    assert hub.vault_of(reg, "alpha") == ("alpha", "alpha")
+    # A vault id no partition is named after still resolves: the FIRST partition
+    # naming it, in slug order, hosts it (gen-conf's rule, copied deliberately).
+    run(hub, monkeypatch, ["partition", "set", "kid", "--vault", "sharedacct"])
+    reg = json.loads(registry.read_text())
+    assert hub.vault_of(reg, "kid") == ("sharedacct", "kid")
+    assert hub.vault_of(reg, "alpha") == ("alpha", "alpha")
+    # An unknown slug is its own vault, which is what the registry defaults to,
+    # so supervisorctl's own "no such process" stays the answer.
+    assert hub.vault_of(reg, "ghost") == ("ghost", "ghost")
+
+
+def test_partition_list_says_which_partition_holds_the_browser(hub_env,
+                                                               monkeypatch,
+                                                               capsys):
+    """`hub vault start <slug>` follows whatever this line prints, so a shared
+    vault has to be visible in `partition list` or the operator starts sign-in
+    on a partition that has no chromium and waits for a browser that never
+    comes."""
+    hub, _ = hub_env
+    run(hub, monkeypatch, ["partition", "add", "alpha", "--owner", "owner"])
+    run(hub, monkeypatch, ["partition", "add", "kid", "--vault", "alpha",
+                           "--owner", "owner"])
+    assert run(hub, monkeypatch, ["partition", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "vault=alpha (browser)" in out
+    assert "vault=alpha (via alpha)" in out
+
+
+def test_adding_to_a_shared_vault_says_no_sign_in_is_needed_there(hub_env,
+                                                                  monkeypatch,
+                                                                  capsys):
+    """The line an added partition gets has to be about the shared browser, not
+    the usual "the watchdog reloads" line: `hub vault start kid` on a member
+    drives alpha's chromium, and nobody has to sign into a chromium that does
+    not exist for it.
+    """
+    hub, registry = hub_env
+    run(hub, monkeypatch, ["partition", "add", "alpha", "--owner", "owner"])
+    assert run(hub, monkeypatch, ["partition", "add", "beta", "--owner", "owner"]) == 0
+    out = capsys.readouterr().out
+    assert "ONE browser" not in out              # beta is its own vault
+    assert "watchdog reloads" in out
+    assert run(hub, monkeypatch, ["partition", "add", "kid", "--vault", "alpha",
+                                  "--owner", "owner"]) == 0
+    assert spec_of(registry, "kid")["vault"] == "alpha"
+    out = capsys.readouterr().out
+    assert "it signs in as vault alpha with alpha" in out
+    assert "ONE browser (on alpha)" in out
+
+
+def test_removing_the_host_moves_the_vault_to_the_member(hub_env, monkeypatch,
+                                                         capsys):
+    """A vault id outlives the partition that gave it its name: its profile and
+    jar under vaults/<id>/ have to belong to somebody supervision can start, and
+    the operator has to be told which one, because `hub vault start` for the
+    member now talks to a program that lives on that member."""
+    hub, registry = hub_env
+    run(hub, monkeypatch, ["partition", "add", "alpha", "--owner", "owner"])
+    run(hub, monkeypatch, ["partition", "add", "kid", "--vault", "alpha",
+                           "--owner", "owner"])
+    assert run(hub, monkeypatch, ["partition", "rm", "alpha"]) == 0
+    out = capsys.readouterr().out
+    assert "vault alpha moves to kid" in out
+    reg = json.loads(registry.read_text())
+    assert hub.vault_of(reg, "kid") == ("alpha", "kid")
+
+
+def test_removing_the_last_partition_says_the_vault_is_unhosted(hub_env,
+                                                                monkeypatch,
+                                                                capsys):
+    hub, _ = hub_env
+    run(hub, monkeypatch, ["partition", "add", "alpha", "--owner", "owner"])
+    assert run(hub, monkeypatch, ["partition", "rm", "alpha"]) == 0
+    assert "no partition left names vault alpha" in capsys.readouterr().out
+
+
+def test_repointing_a_vault_reports_both_ends(hub_env, monkeypatch, capsys):
+    """`--vault` moves a partition between Google accounts. The message has to
+    cover both sides: where the moved partition's sign-in now comes from, and
+    where the vault it LEFT now runs, because that is the browser the operator
+    has to start next time."""
+    hub, registry = hub_env
+    run(hub, monkeypatch, ["partition", "add", "alpha", "--owner", "owner"])
+    run(hub, monkeypatch, ["partition", "add", "kid", "--vault", "alpha",
+                           "--owner", "owner"])
+    run(hub, monkeypatch, ["partition", "add", "beta", "--owner", "owner"])
+    assert run(hub, monkeypatch, ["partition", "set", "alpha",
+                                  "--vault", "beta"]) == 0
+    out = capsys.readouterr().out
+    assert "alpha now signs in as vault beta" in out
+    assert "vault alpha moves to kid" in out
+    assert spec_of(registry, "alpha")["vault"] == "beta"

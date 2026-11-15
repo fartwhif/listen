@@ -21,6 +21,14 @@ UI at that origin's root) and the shared tunester on 8102. Those are PUBLISHED
 by docker-compose; unpublished ports are unreachable from the WireGuard peer
 regardless of bind, so binds stay default and only index 0's grabbytube and
 radio are non-loopback.
+
+Vault programs are per VIRTUAL HOST (vault_hosts), not per partition: a vault id
+names a GOOGLE ACCOUNT, and several partitions may name the same one. Only the
+host partition gets a `vault-<vault>` program, because two chromiums signing in
+as the same account fight over the session (each re-types the password, each
+rotates the cookie jar the other is using). A member partition's browser ports
+are allocated by the map above and stay idle; its noVNC door proxies to the
+host's.
 """
 import json
 import os
@@ -156,6 +164,45 @@ def load_registry() -> dict:
               f"limit); the extras are ignored", file=sys.stderr)
         slugs = slugs[:MAX_PARTITIONS]
     return {"slugs": slugs, "front": front, "partitions": parts}
+
+
+def vault_hosts(reg: dict) -> dict:
+    """vault_slug -> the one slug whose programs own that vault's browser family.
+
+    A vault id names a GOOGLE ACCOUNT, not a partition: `vault: "owner"` on three
+    partitions means three partitions share one sign-in. One family per vault is
+    what makes that safe - two chromiums authenticating as the same account each
+    re-type the password and each rotate the jar the other's consumers write back
+    to, which is the two-exporters-competing bug this dedup removes.
+
+    The host is the FIRST partition (in slug order, i.e. the order that also
+    decides ports) naming the vault. When the partition a vault was named after
+    is removed, the surviving member that still names it becomes the host: the
+    vault id outlives the partition that gave it its name, and its profile and
+    cookies under vaults/<id>/ have to belong to somebody supervision can start.
+    """
+    hosts: dict[str, str] = {}
+    for slug in reg["slugs"]:
+        hosts.setdefault(reg["partitions"][slug]["vault_slug"], slug)
+    return hosts
+
+
+def companion_paths(reg: dict, host: str) -> dict:
+    """Every OTHER partition's jar/state paths for the vault `host` owns.
+
+    A member partition's apps each read their own COOKIES_FILE (that is what
+    separates tenants), so the host's exporter has to hand them the jar it just
+    verified - otherwise a member's cookies stay stale until its own (now absent)
+    browser refreshed them. gen-conf renders these as comma lists into the vault
+    program's environment; cookie_exporter.py fans its writes out to them.
+    """
+    vault = reg["partitions"][host]["vault_slug"]
+    members = [s for s in reg["slugs"]
+               if reg["partitions"][s]["vault_slug"] == vault and s != host]
+    return {
+        "cookies": [f"{DATA}/users/{s}/cookies.txt" for s in members],
+        "state": [f"{DATA}/users/{s}/session-state.json" for s in members],
+    }
 
 
 def tenant_vals(slug: str, spec: dict) -> dict:
@@ -312,25 +359,51 @@ def vault_env(slug: str, spec: dict, reg: dict) -> str:
     """A vault family (chromium, Xvfb, x11vnc, websockify, the VNC keyboard
     driver, the cookie exporter, the auto sign-in daemon) gets its partition's
     tenant env - which already carries the vault dirs, the loopback API URLs
-    and the per-vault browser ports - plus the Google/VNC credentials and the
-    public door URL.
+    and the per-vault browser ports - plus the Google/VNC credentials, the
+    public door URL and the FAN-OUT targets.
 
-    Every partition that shares this vault has its own apps, and the exporter's
-    user-agent push has to reach all of them, so the family gets the full comma
-    lists. The single-valued DRIVEPOD_API_URL / GRABBY_API_URL from the tenant
-    env stay as they are (the host partition), so the exporter works on one
-    partition whether or not it has been taught the list forms.
+    `slug` here is the vault's HOST (see vault_hosts); the family serves every
+    partition that names this vault, so the exporter's user-agent push has to
+    reach all of their apps (the comma URL lists) and its writes have to land in
+    all of their cookie paths:
+
+      COOKIE_FANOUT_FILES / COOKIE_SESSION_STATE_FANOUT - the members' jars and
+      state files. Each partition's apps read their own COOKIES_FILE, so the
+      host's verified jar has to be copied there or a member's session ages out
+      with no browser of its own to refresh it. The HOST'S OWN paths are not in
+      these lists: the exporter keeps writing them the way it always did, and it
+      is the only writer of `up` for this account.
+
+    The single-valued DRIVEPOD_API_URL / GRABBY_API_URL from the tenant env stay
+    as they are (the host partition), so the exporter works on one partition
+    whether or not it has been taught the list forms.
+
+    Credential precedence is the registry first: `GOOGLE_EMAIL`/`GOOGLE_PASSWORD`
+    name the ACCOUNT a vault is, and a vault is per-partition configuration like
+    any other, so the host partition's `settings` win and the container's own
+    environment is only the fallback for a box with one account in `.env` (the
+    pre-hub shape). Getting this backwards signs every vault in as the `.env`
+    account while each partition's apps keep writing a different jar - the
+    browser would be authenticating somebody else's session.
     """
     companions = [ports(reg["partitions"][s]["index"]) for s in reg["slugs"]
                   if reg["partitions"][s]["vault_slug"] == spec["vault_slug"]]
+    paths = companion_paths(reg, slug)
     vals = {"VNC_URL": vnc_door(slug),
             "DRIVEPOD_PUSH_URLS": ",".join(
                 f"http://127.0.0.1:{p['drivepod']}" for p in companions),
             "GRABBY_PUSH_URLS": ",".join(
                 f"http://127.0.0.1:{p['grabby']}" for p in companions)}
-    vals.update(passthrough(VAULT_KEYS))
-    merged = tenant_vals(slug, spec)
-    merged.update(vals)
+    # Omitted, not empty, when the vault has no members: unset is exactly "no
+    # companions" to the exporter, and an empty quoted value in the generated
+    # file reads like a path that went missing.
+    if paths["cookies"]:
+        vals["COOKIE_FANOUT_FILES"] = ",".join(paths["cookies"])
+    if paths["state"]:
+        vals["COOKIE_SESSION_STATE_FANOUT"] = ",".join(paths["state"])
+    merged = dict(passthrough(VAULT_KEYS))   # the container's .env: the fallback
+    merged.update(tenant_vals(slug, spec))   # registry settings win over it
+    merged.update(vals)                      # the family's own wiring wins most
     return env_str(merged)
 
 
@@ -453,16 +526,22 @@ def supervisor_conf(reg: dict) -> str:
 
     # ---- vaults ------------------------------------------------------
     # autostart/autorestart false: the whole point is that no browser runs
-    # until a partition's cookies are actually stale (the owner's invariant,
-    # enforced by construction). The watchdog starts and stops these; so does
+    # until a session is actually stale (the owner's invariant, enforced by
+    # construction). The watchdog starts and stops these; so does
     # `hub vault start|stop`.
-    for slug in reg["slugs"]:
-        spec = reg["partitions"][slug]
+    #
+    # ONE program per distinct vault id (vault_hosts), named after the VAULT, not
+    # the partition: the vault id is the Google account, and starting one family
+    # per partition sharing it is what put two chromiums and two exporters on one
+    # account. The program carries the host partition's tenant env, so its
+    # browser ports, profile dir and jar are that partition's; members get their
+    # jar by fan-out and their door by proxy (see _locations).
+    for vault, host in vault_hosts(reg).items():
         out.append(program(
-            f"vault-{slug}",
-            f"python3 {STACK}/platform/vault-run.py {slug}",
-            f"{STACK}/vault", vault_env(slug, spec, reg), 40, 5, 30,
-            autostart=False, autorestart=False))
+            f"vault-{vault}",
+            f"python3 {STACK}/platform/vault-run.py {host}",
+            f"{STACK}/vault", vault_env(host, reg["partitions"][host], reg),
+            40, 5, 30, autostart=False, autorestart=False))
     return "".join(out)
 
 
@@ -499,7 +578,7 @@ SVC = "    include /etc/nginx/snippets/proxy-svc.conf;\n"
 
 
 def _locations(slug: str, prefix: str, p: dict, spec: dict,
-               shell: bool = True) -> str:
+               shell: bool = True, ws_port: int | None = None) -> str:
     """Locations for one partition.
 
     `prefix` is "/l/<slug>" for every partition, or "" for the front
@@ -509,6 +588,12 @@ def _locations(slug: str, prefix: str, p: dict, spec: dict,
     a LITERAL for that slug - no runtime-variable upstreams, no resolver, no
     map-then-interpolate - so a bad generated file is caught by `nginx -t`
     rather than by the first request.
+
+    `ws_port` is the websockify port the door proxies to, and it DIFFERS from
+    this partition's own whenever the partition shares another's vault: no
+    chromium runs for a member, so its noVNC door has to reach the HOST's
+    browser. Omitted means "this slug is its own vault host" (vault_hosts hands
+    both callers the value that is not).
     """
     gate = GATE_JSON.format(slug=slug)
     glogin = GATE_LOGIN.format(slug=slug)
@@ -654,7 +739,7 @@ def _locations(slug: str, prefix: str, p: dict, spec: dict,
                f"    alias {NOVNC_DIR}/;\n"
                "    try_files $uri =404;\n}\n")
     out.append(f"location = {prefix}/vnc/websockify {{\n{gate}"
-               f"    proxy_pass http://127.0.0.1:{p['ws']};\n"
+               f"    proxy_pass http://127.0.0.1:{ws_port or p['ws']};\n"
                "    proxy_http_version 1.1;\n"
                "    proxy_set_header Upgrade $http_upgrade;\n"
                '    proxy_set_header Connection "upgrade";\n'
@@ -723,22 +808,30 @@ def _locations(slug: str, prefix: str, p: dict, spec: dict,
     return "".join(out)
 
 
-def _front_bare(front: str, p: dict) -> str:
+def _front_bare(front: str, p: dict, ws_port: int | None = None) -> str:
     """Front-partition aliases with no prefix, so the callers that predate the
     gateway keep working byte-identically. No shell here: the portal root is
     the picker (the decision on the legacy hostnames), and the front
     partition's own SPA lives at /l/<front>/ like every other one."""
-    return _locations(front, "", p, {}, shell=False)
+    return _locations(front, "", p, {}, shell=False, ws_port=ws_port)
 
 
 def nginx_locations(reg: dict) -> str:
+    hosts = vault_hosts(reg)
     out = ["# generated by platform/gen-conf.py - do not edit\n"]
     for slug in reg["slugs"]:
         spec = reg["partitions"][slug]
-        out.append(_locations(slug, f"/l/{slug}", ports(spec["index"]), spec))
+        # The door follows the vault's host, so a member's noVNC reaches the one
+        # browser its account has. Identity when the slug IS the host.
+        host = hosts[spec["vault_slug"]]
+        ws = ports(reg["partitions"][host]["index"])["ws"]
+        out.append(_locations(slug, f"/l/{slug}", ports(spec["index"]), spec,
+                              ws_port=ws))
     if reg["front"]:
         front = reg["partitions"][reg["front"]]
-        out.append(_front_bare(reg["front"], ports(front["index"])))
+        host = hosts[front["vault_slug"]]
+        ws = ports(reg["partitions"][host]["index"])["ws"]
+        out.append(_front_bare(reg["front"], ports(front["index"]), ws))
     return "".join(out)
 
 
@@ -820,11 +913,25 @@ def spa_shells(reg: dict) -> list[tuple[str, str]]:
 def picker_html(reg: dict) -> str:
     """The public door: links to every partition from the same registry that
     drives the proxies, so a new partition appears here without a rebuild."""
+    hosts = vault_hosts(reg)
     cards = []
     for slug in reg["slugs"]:
         spec = reg["partitions"][slug]
         mode = "shared" if spec["mode"] == "shared" else "personal"
         members = len(spec.get("members", [])) or 1
+        vault = spec["vault_slug"]
+        # Name the vault and say when it is shared: a vault is a Google account,
+        # and picking between two partitions that sign in as the SAME one is a
+        # different choice from picking between two accounts (one browser covers
+        # both, so starting sign-in in one starts it for the other).
+        users = sum(1 for s in reg["slugs"]
+                    if reg["partitions"][s]["vault_slug"] == vault)
+        if users == 1:
+            shared = ""
+        elif slug == hosts[vault]:
+            shared = f" (sign-in host for {users - 1} other)"
+        else:
+            shared = f" (signs in via /{hosts[vault]})"
         cards.append(
             f'    <a class="card" href="/l/{slug}/">\n'
             f'      <h2>{spec["name"]}</h2>\n'
@@ -832,7 +939,7 @@ def picker_html(reg: dict) -> str:
             f'      <p class="meta">{mode} &middot; {members} member'
             f'{"s" if members != 1 else ""}'
             f'{" &middot; radio" if spec.get("radio", True) else ""}'
-            f' &middot; vault {spec["vault_slug"]}</p>\n'
+            f' &middot; vault {vault}{shared}</p>\n'
             f'    </a>')
     return ("<!doctype html>\n<html lang=en>\n<head>\n<meta charset=utf-8>\n"
             "<meta name=viewport content=\"width=device-width,initial-scale=1\">\n"
