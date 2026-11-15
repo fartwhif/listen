@@ -1,0 +1,1172 @@
+# DrivePod — Technical Architecture & Specification
+
+> Authoritative technical reference, verified against the source (2026-10-16)
+> and against the live deployment (768 channels, ~309k video rows, 1,592
+> index items, 1,624 cache folders, 1,002 GrabbyTube tracks).
+>
+> - `README.md` — human-facing overview (marketing + install).
+> - `AGENTS.md` — agent conventions (build/deploy commands, workflow).
+> - `INTELLIGENCE.md` — incident write-up: the datacenter-IP 403 diagnosis and the
+>   combined-stream format fix (2026-08-24).
+> - `ARCHITECTURE.md` (this file) — how the system actually works, end to end.
+
+---
+
+## 1. What DrivePod Is
+
+A self-hosted, single-purpose podcast player. It continuously harvests new videos
+from a prioritized list of YouTube channels, downloads them, transcodes them to
+MP3 (optionally mono, 32–192 kbps), and serves them as a resumable,
+data-throttled audio queue for a car/phone. It is built for intermittent
+low-bandwidth connectivity (driving): everything about playback, state
+persistence, and indexing is designed to survive network blackholes.
+
+A second content source is **GrabbyTube** (sibling project,
+`/home/user/projects/grabbytube`): a pre-existing MP3 catalog that DrivePod mixes
+into the queue at a configurable duration ratio (the "shufflebag").
+
+Two containers, one Docker image:
+
+| Container            | Image                                  | Role                                                        |
+|----------------------|----------------------------------------|-------------------------------------------------------------|
+| `drivepod`           | built locally from `Dockerfile`        | nginx (SPA + media) + Express backend + yt-dlp/ffmpeg       |
+| `drivepod-bgutil`    | `brainicism/bgutil-ytdlp-pot-provider` | PO-Token sidecar on `:4416` for yt-dlp (datacenter IPs)     |
+
+Both join the external Docker network **`shared`** (also shared with
+`grabbytube` + `grabbytube-bgutil`), so DrivePod reaches GrabbyTube at
+`http://grabbytube:8101` by service name and yt-dlp reaches the sidecar at
+`http://drivepod-bgutil:4416`.
+
+The container is `privileged` with `NET_ADMIN`/`SYS_MODULE` and mounts
+`/lib/modules:ro` because it brings up a **WireGuard client** (`wg0`) at
+startup — the deployment is reached over a VPN tunnel, not a public port.
+
+---
+
+## 2. Repository Layout
+
+```
+drivepod/
+├── Dockerfile                 # 2-stage: Angular build → node:20-bookworm-slim runtime
+├── docker-compose.yml         # drivepod + drivepod-bgutil, external net `shared`
+├── drivepod-ngnix             # nginx vhost (SPA + /api proxy + /cache + no-cache index)
+├── entrypoint.sh              # sources .env, up WireGuard, prisma db push, node + nginx
+├── wireguard/wg0.conf.template
+├── deploy-frontend.sh         # bare-metal frontend deploy (ng build → /var/www/drivepod)
+├── .env / .env.example        # deployment env (not committed; .env has real keys)
+├── AGENTS.md / INTELLIGENCE.md / ARCHITECTURE.md / README.md
+├── backend/
+│   ├── src/server.ts          # ALL of the backend (3,149 lines, single file)
+│   ├── prisma/schema.prisma   # 3 models: Channel, Video, Config
+│   └── package.json           # express, prisma, rss-parser, node-cron, multer, ...
+├── frontend/src/app/
+│   ├── app.component.ts       # ALL of the UI logic (2,202 lines, one component)
+│   ├── stall-guard.ts         # pure playback-liveness decision (see §12.3)
+│   ├── app.routes.ts          # single route '' → AppComponent (no auth routes)
+│   ├── app.component.html     # 836-line template, 6 tabs, Tailwind
+│   └── root.component.ts      # <router-outlet />
+├── cache/                     # mounted volume — see §8 (videos, index.json, rss/)
+├── data/                      # mounted volume — database.db, cookies.txt (temp)
+├── screenshots/               # README images
+└── .hermes/plans/             # agent scratch, not app code
+```
+
+Key structural facts:
+
+- **One backend file** (`server.ts`): all routes, the harvester, the index
+  writer, the shufflebag, and the import logic live inline. No routers, no
+  services, no middleware files.
+- **One frontend component** (`AppComponent`): no lazy loading, no per-tab
+  components; tabs are `@if (activeTab() === …)` blocks in a single template.
+  **There is no login page, no auth guard, no HTTP interceptor** — the router
+  has exactly one route (`''` → AppComponent, wildcard redirects to it).
+- **Frontend app version constant**: `1.10.0` (`APP_VERSION` in app.component.ts).
+
+---
+
+## 3. Containers, Ports, Volumes, Networking
+
+### 3.1 Port map (container)
+
+| Port | What                                   |
+|------|----------------------------------------|
+| 80   | nginx — SPA, `/api/` proxy, `/cache/`  |
+| 3000 | Express backend (loopback only; proxied by nginx) |
+| 4416 | `drivepod-bgutil` PO-token provider (docker-net only) |
+
+Host mapping: `${VPS_IP:-0.0.0.0}:${NGINX_PORT:-24320}:80` → live deployment
+exposes **24320** on all interfaces (access actually arrives via WireGuard).
+
+### 3.2 Volumes (live deployment)
+
+Host sides are repo-relative so the repo carries no machine-specific paths;
+container sides are the neutral constants that `.env` (`CACHE_DIR`, `DATA_DIR`,
+`DATABASE_URL`) and `drivepod-ngnix` refer to.
+
+| Host path (compose)  | Container path                   | Purpose                                    |
+|----------------------|----------------------------------|--------------------------------------------|
+| `./data`             | `/data` (`DATA_DIR`)             | SQLite DB + temp `cookies.txt`             |
+| `./cache`            | `/cache` (`CACHE_DIR`)           | MP3s, thumbnails, index.json, rss/ cache   |
+| `../ytcookies/data`  | `/shared-cookies` (RO in effect) | live YouTube cookie export (Netscape)      |
+| `/lib/modules`       | same (ro)                        | WireGuard kernel modules                   |
+
+Stale absolute `audioPath` DB rows from an earlier host layout are repaired on
+startup by the self-heal pass (§5) to the canonical `{CACHE_DIR}/{videoId}/`
+layout, so a relocation needs no manual DB surgery.
+
+The shared cache dir is **shared with GrabbyTube** — both projects write
+per-video folders under `cache/`. DrivePod's cleanup routines must therefore
+recognize GrabbyTube folders (a folder whose `{videoId}.json` contains a
+`videoId` key is GrabbyTube's and is never deleted).
+
+### 3.3 Entrypoint order (`entrypoint.sh`)
+
+1. Normalize `.env` (strip spaces around `=`) and `source` it.
+2. If `WG_PRIVATE_KEY` + `WG_PEER_PUBLIC_KEY` + `WG_PEER_ENDPOINT` are set,
+   render `wg0.conf` from the template and `wg-quick up wg0`.
+3. `npx prisma db push --accept-data-loss` (schema sync on every boot).
+4. `npm start` (runs `node dist/server.js`) in the background.
+5. `nginx -g 'daemon off;'` as the foreground process.
+
+### 3.4 Image build (`Dockerfile`)
+
+Stage 1: `node:20-bookworm-slim` builds the Angular app
+(`ng build --configuration=production`).
+
+Stage 2 runtime installs (all required, several are easy to miss):
+
+- `ca-certificates` — must be explicit; `--no-install-recommends` drops it.
+- `python3 python3-pip python3-venv` — yt-dlp is a Python script.
+- `ffmpeg vbrfix` — transcode + CBR normalization.
+- `nginx` — serves SPA/media.
+- `wireguard iproute2 procps iptables unzip` — tunnel + WSL2 Docker Desktop
+  networking needs.
+- `yt-dlp` — latest release binary from GitHub.
+- `bgutil-ytdlp-pot-provider` — pip package (PO-token provider discovery).
+- `Deno` — installed to `/usr/local/bin/deno`; required by
+  `--remote-components ejs:github` (JS challenge solving).
+
+Prisma client is regenerated (`npx prisma generate`) **before** the tsc build.
+
+---
+
+## 4. Data Model (Prisma + SQLite)
+
+`backend/prisma/schema.prisma` — 3 models. SQLite file at
+`data/database.db` (`DATABASE_URL=file:/…`).
+
+### Channel
+
+| Field            | Type            | Notes                                              |
+|------------------|-----------------|----------------------------------------------------|
+| `id`             | String (cuid)   | PK                                                 |
+| `channelId`      | String @unique  | The YouTube `UC…` ID (harvest skips non-`UC…`)     |
+| `title`          | String          | Display name (auto-fetched from RSS if absent)     |
+| `order`          | Int (0)         | Harvest priority; UI ↑↑ ↑ ↓ ↓↓ rewrites it         |
+| `ignoreScrapeDone` | Bool (false)  | One-time "ignore sweep" already ran for this channel |
+| `active`         | Bool (true)     | Harvest toggle (🟢/⏸️ in Settings)                  |
+| `minDuration`    | Int?            | Per-channel duration override (minutes), null=global |
+| `maxDuration`    | Int?            | same                                                 |
+| `createdAt`      | DateTime        |                                                    |
+
+Indexes: `[order]`.
+
+### Video
+
+| Field         | Type        | Notes                                                   |
+|---------------|-------------|---------------------------------------------------------|
+| `id`          | String (cuid) | PK                                                    |
+| `videoId`     | String @unique | YouTube ID (11 chars) or GrabbyTube track ID         |
+| `channelId`   | String (FK→Channel.channelId) | grabby items point at a **per-artist placeholder**: `UCGrabbyTube` + base64url(author), whose `title` = the artist (bare `UCGrabbyTube` when no author) |
+| `title`       | String      |                                                        |
+| `description` | String?     | (set from metadata JSON if present)                    |
+| `publishedAt` | DateTime    | **Grabby items carry a *clustered* timestamp** (uniform inside the 60-min band below the newest normal content, §9), not the real upload date |
+| `thumbnailPath` | String?   | `/cache/<id>/<id>-small.webp`                          |
+| `audioPath`   | String      | absolute path to `<id>.mp3`                            |
+| `subtitlePath`| String?     | unused in practice                                     |
+| `watched`     | Bool (false)|                                                        |
+| `progress`    | Float (0)   | seconds, int-rounded by the frontend                   |
+| `duration`    | Float?      | seconds (ffprobe)                                      |
+| `ignored`     | Bool (false)| excluded from index.json and from harvest              |
+| `protected`   | Bool (false)| exempt from auto-purge and purge-all                   |
+| `isGrabby`    | Bool (false)| GrabbyTube-origin track; special-cased everywhere      |
+| `createdAt`   | DateTime    | harvest-side; used by the X-per-Y-hours rate limit     |
+
+Indexes: `[publishedAt]`, `[watched]`, `[ignored]`, `[channelId, ignored]`
+(the last is what makes the per-channel "already in DB" check cheap at scale).
+
+### Config
+
+Key/value store (`key` unique, `value` String — everything is stored as a
+string; parsed at the read site). See §10 for the full live key table.
+
+### Scale (live, 2026-10-16)
+
+- 768 channels; **308,749 video rows** — the large majority are
+  `ignored: true` records created by the per-channel ignore sweeps (§7.4)
+  and duration/pub-date filtering. Only **non-ignored** rows appear in
+  `index.json` (1,592 items, 1,016 unwatched).
+- 716 rows currently `isGrabby: true` (non-ignored).
+- 1,624 folders under `cache/` (DrivePod + GrabbyTube items + `rss/` +
+  top-level JSON files).
+
+---
+
+## 5. Backend (`backend/src/server.ts`)
+
+Single file, ~2,500 lines, structured top-to-bottom: constants → helpers →
+cleanup → shufflebag → discovery → download → harvest → API routes → startup.
+
+### 5.1 Global state & concurrency
+
+```
+isHarvesting  — set during harvestAndPurge(); re-entry skipped
+isImporting   — set during POST /api/import; harvest skips while true
+                (POST /api/import 409s if isHarvesting; harvest skips if isImporting)
+UseAlternateListGetterMethod — flipped every harvest run (see §7.2)
+harvestStatus — plain object polled by GET /api/harvest-status
+```
+
+The harvest/import lock exists because an unlocked import's in-progress cache
+folder would be treated as an orphan by `cleanupCorruptedFolders()` and deleted
+mid-download.
+
+### 5.2 Config access
+
+`getConfig(key, default)` reads-or-seeds; `setConfig` upserts. All values are
+strings. **Gotcha (documented in AGENTS skill): `POST /api/config` only persists
+the fields it explicitly destructures** — an unknown field is silently dropped.
+Adding a setting requires editing the GET handler, the POST destructuring, the
+POST `setConfig` call, and the frontend.
+
+### 5.3 Cookies
+
+Two sources, one precedence (`effectiveCookiesFile()`):
+
+1. `/shared-cookies/cookies.txt` — the live export from the **ytcookies**
+   container (headless Chromium login + CDP cookie exporter, refreshed
+   continuously). Preferred whenever present and non-empty.
+2. `data/cookies.txt` — written from the DB `cookies` config (uploaded via
+   `POST /api/cookies` or pasted via `POST /api/config`) for the duration of a
+   harvest, then deleted in `finally`.
+
+The DB `cookies` value is also what `getBaseYtDlpCommand()` reads, but the file
+precedence above is what actually gets passed to yt-dlp.
+
+### 5.4 yt-dlp command construction
+
+`getBaseYtDlpCommand()` (single source of truth for every yt-dlp invocation):
+
+```
+yt-dlp --no-progress
+  --remote-components ejs:github                      # Deno-based JS challenge solving
+  --extractor-args youtube:player_client=mweb          # mweb client (not `web`)
+  --extractor-args youtubepot-bgutilhttp:base_url=http://drivepod-bgutil:4416
+  --min-sleep-interval 5 --max-sleep-interval 15
+  --user-agent "<config userAgent>"
+  [--cookies "<effective file>"]
+```
+
+Download adds:
+
+```
+  -f "b[acodec!=none][height<=360]/b[acodec!=none]/ba/b"   # COMBINED stream (see below)
+  --write-thumbnail --no-overwrites --continue
+  --match-filter "live_status != is_live & live_status != is_upcoming"
+  --output "<cacheDir>/<id>/%(id)s.%(ext)s"
+```
+
+**Why combined streams**: from datacenter egress, Google 403s audio-only and
+video-only signed URLs but serves combined video+audio (≤360p mp4) fine.
+`bestaudio` 403'd on every download. The small mp4 is downloaded and audio is
+extracted by ffmpeg. Full diagnosis in `INTELLIGENCE.md`. Watch item: if
+combined streams ever start 403'ing, a residential proxy is the fix
+(`--proxy` in `getBaseYtDlpCommand()`).
+
+### 5.5 Download & transcode pipeline (`downloadAndProcessVideo`)
+
+For one video, into `cache/<videoId>/`:
+
+1. Skip if `<id>.mp3` already exists.
+2. yt-dlp download (combined format above) + `--write-thumbnail`.
+3. Accept `.webm`, else `.m4a`, else `.mp4` as the raw source.
+4. Thumbnail: original → ffmpeg `scale=400:225` (aspect preserved) →
+   `<id>-small.webp` (fallback to original on failure).
+5. Build a `.ffmeta` sidecar: `title`, `artist` (channel), `date`, and
+   `comment` = full video info JSON.
+6. ffmpeg → MP3: `libmp3lame`, `-ar 24000`, `-b:a <bitrate>k`,
+   `-id3v2_version 3`, embedded cover art (`mjpeg`, `attached_pic`),
+   `-ac 1` when mono.
+7. `vbrfix -always` → CBR (seekable, player-friendly).
+8. `validateMp3File()` — post-transcode integrity gate: zero-run scan
+   (any run >256KB of consecutive 0x00 = a hole), head check (ID3 tag or
+   frame sync at byte 0), Xing/Info header presence (ffprobe's
+   "Estimating duration from bitrate" warning means it's missing), a
+   duration check vs the YouTube-reported value (10%, min 30s tolerance)
+   when the caller supplied one, and a size/header check: file size must
+   equal the Xing "bytes" field + tag size (vbrfix's count is exact —
+   `readMp3HeaderClaim()`). A failure re-transcodes once (raw still on
+   disk), then discards the file and returns false — the track is never
+   published. Why: the cache dir is a 9p-mounted Windows folder; silent
+   I/O failures there have produced zero-padded files that ffprobe still
+   measures (duration estimated from file size) but no player can demux
+   (Chrome: MEDIA_ERR_SRC_NOT_SUPPORTED). On 2026-09-20 the 9p Windows
+   I/O path additionally corrupted finished files **post-publication**
+   (one track's head spliced ahead of another track's tail; a 1.8MB
+   leading zero-hole) — 11 files in one concurrent-write burst; no sync
+   software is involved (operator-verified: OneDrive uninstalled, no
+   reparse points), so the suspected actor is the 9p/drvfs layer itself.
+   Every pre-publish check had already passed — so
+   `cleanupCorruptedFolders()` re-checks head + size claim on every
+   published file each harvest and quarantines failures (§6, step 2).
+9. Delete the raw container file.
+
+Failure classification:
+
+- cookie-invalid messages → **auto-clears the DB `cookies` config**
+  (`setConfig('cookies','')`);
+- live / premiere / age-gate errors → logged and skipped (return false);
+- validation failure after the re-transcode → file deleted, return false;
+- any failure with no mp3 → folder removed + index regenerated.
+
+`getAudioDuration()` (ffprobe) measures the final MP3 for the DB row.
+
+### 5.6 Index file (`cache/index.json`) — the contract
+
+`updateIndexFile()` is the single writer of the file the SPA consumes. Called
+after every DB/mutation that affects the queue: batch inserts, watched/
+progress updates, protect toggles, ignores, purges, channel deletes, grabby
+distribution, corruption cleanup.
+
+Behavior:
+
+- Rows: `ignored: false` only, **`orderBy: publishedAt desc, videoId asc`** —
+  the `videoId` tiebreaker makes order deterministic for shared timestamps
+  (batched imports, grabby clusters); without it the playlist reshuffled
+  between refreshes.
+- Per row: DB record merged with `cache/<id>/<id>.json` (per-item metadata
+  wins) **except `publishedAt`, which is always pinned to the DB value** —
+  a diverged per-item JSON (e.g. a re-import that wrote a fresh date into
+  the file) must never reorder the queue; the DB is the single source of
+  truth. This also covers grabby items, whose file carries the original
+  YouTube date in `YYYYMMDD` format.
+- Paths are rewritten with the `/cache/` prefix (nginx serves `/cache/` →
+  CACHE_DIR). `audioPath` is always `/cache/<id>/<id>.mp3`.
+- **Self-heal**: grabby rows whose file resolves to nothing
+  (`resolveGrabbyAudioPath()` finds neither the literal nor the canonical
+  mp3) are deleted from the DB here (they may have been consumed from the
+  GrabbyTube UI).
+- Atomic write: `index.tmp.json` → rename.
+
+Nginx serves the queue files via a regex location
+`~ ^/cache/(index|progress)\.json$`: `Cache-Control: no-cache` + `etag on`
+(no max-age — a changed file is always re-downloaded, an unchanged one is a
+~0 B 304). The SPA fetches stable URLs with `cache: 'no-cache'`; never
+reintroduce a `?_t=` buster or `no-store`. MP3s and thumbnails remain
+cacheable (`immutable`).
+
+`progress.json` is split out of the index: `index.json` carries
+`progress: 0` for every item (byte-stable while a track plays) and
+`progress.json` holds only in-queue items with `0 < progress < duration`
+as `[{videoId, progress}]` (~1.5 KB raw — the only file that churns on the
+~10 s progress saves). `writeIfChanged()` skips byte-identical rewrites —
+a no-op rewrite would bump the ETag and force a full re-download on every
+2-minute poll.
+
+The SPA shell gets `Cache-Control: no-cache` (revalidate via ETag) and the
+content-hashed assets (`main-*.js`, `styles-*.css`) get
+`public, max-age=31536000, immutable`. Without explicit headers, Chromium
+heuristic-caches the header-less `index.html` and kept serving an 8-day-old
+deploy's bundle indefinitely (2026-09-20: stale bundle still contained the
+unbounded error-reload loop after the fixed build was live on the server).
+
+### 5.7 Startup sequence (bottom of file)
+
+1. If `index.json` is absent → write one immediately.
+2. `initShuffleBag()` (async, non-blocking).
+3. `cron.schedule('*/5 * * * *', harvestAndPurge)` **and** one immediate
+   `harvestAndPurge()`.
+4. `app.listen(3000)`.
+
+---
+
+## 6. Harvest Pipeline (`harvestAndPurge`)
+
+Runs every 5 minutes and once at boot. Full sequence:
+
+1. **Re-entry guards** (`isHarvesting` / `isImporting`), reset `harvestStatus`.
+2. **`cleanupCorruptedFolders()`** (full consistency pass):
+   - Folder with **no** DB record: if its `{id}.json` has a `videoId` key it's
+     a GrabbyTube item → skip; otherwise delete as orphan.
+   - Folder **with** record but corrupt (empty, 0/2+ mp3s, 0/2+ `{id}.json`,
+     >2 thumbnails): grabby → delete **DB row only, keep files**; normal →
+     delete folder + row.
+   - Orphan DB rows (`ignored:false, isGrabby:false`) with missing folder/mp3
+     → delete row. (Grabby rows are never deleted here; the index self-heal
+     owns that path.)
+   - Structurally valid folder whose MP3 fails an integrity check (junk at
+     file start — zero-hole or merge artifact; or size vs Xing "bytes"
+     claim off by more than max(4KB, 0.5%)) → delete folder + row
+     (post-publication corruption via the 9p Windows I/O path; grabby folders exempt).
+   - **Stale `audioPath` self-heal**: a row whose stored `audioPath` points
+     at a missing file is re-pointed at the canonical `{id}/{id}.mp3` when
+     that file exists; logs `🔧 Repaired stale audioPath on N row(s)`.
+     (2026-10-16: repaired 224 rows — the stale absolute paths made
+     `/api/stream` 404 and the player skipped the tracks as defunct.)
+3. **`backfillChannelOrders()`** — assign sequential `order` to any channel
+   stuck at 0 (legacy data).
+4. Delete temp cookies file, write effective cookies (shared export needs no
+   temp file).
+5. **Flip `UseAlternateListGetterMethod`** (alternates RSS-first vs
+   yt-dlp-first each run — see §7.2).
+6. Read config: `maxHarvestDays` (default 7), `preferredBitrate` (128),
+   `preferredMono`, `autoPurgeDays` (30), rate limit (`limitEnabled`/
+   `limitVideos`/`limitHours`, default off / 2 per 6 h), global duration
+   filter (default off, 0–720 min).
+7. Load **active** channels ordered by `order`; **drop any whose `channelId`
+   doesn't start with `UC`** (legacy bad IDs were URLs — they'd 404 every
+   harvest).
+8. Process channels with **`MAX_CONCURRENT_CHANNELS = 2`** in a
+   promise-pool loop. Per channel:
+   - **Rate limit (channel-level)**: if `limitEnabled` and the channel
+     already has ≥ `limitVideos` non-ignored videos with `createdAt` in the
+     last `limitHours`, skip the whole channel.
+   - **Ignore sweep** (once per channel, `ignoreScrapeDone=false`): scrape the
+     full catalog (2-year window, `--playlist-items` unbounded, `approximate_date`)
+     and insert every existing video as `ignored: true` so only *new* uploads
+     are ever downloaded. Sets `ignoreScrapeDone=true`.
+   - **Discovery** (`getRssFeedWithCache`): get candidate items + channel title.
+   - Dedupe against DB (`videoId IN (…)`, one query).
+   - Per candidate (skipping existing):
+     - channel-level rate limit re-check (stops mid-list);
+     - pub-date filter: older than `maxHarvestDays` → `ignoreVideo()`;
+     - duration filter (per-channel override, else global if enabled) →
+       `ignoreVideo()`;
+     - `fillMissingMetadata()` — yt-dlp one-liner for
+       `timestamp|duration_string|live_status` (120 s timeout, §7.3) when
+       RSS lacked them; members-only → `ignoreVideo()`; `VODFuture`
+       (live/upcoming) → skip this cycle and retry next (not recorded — a
+       scheduled stream becomes downloadable once its VOD is processed);
+       `post_live` is NOT skipped — it falls through to the download attempt
+       (ended streams are often still flagged `post_live` after the VOD is
+       already served);
+     - re-check filters (metadata may have changed duration/date), passing
+       the resolved `duration` into `ignoreVideo()` (ignored rows were
+       previously stored with NULL duration — now the ignore reason is
+       auditable in the DB);
+     - **`downloadAndProcessVideo()`**;
+     - on success: pick thumbnail, ffprobe duration, write
+       `cache/<id>/<id>.json` (rich metadata), stage for batch insert.
+   - Batch `prisma.video.createMany` + `updateIndexFile()`.
+9. **`distributeGrabbyItems()`** (only when `grabbyMixEnabled`, §9).
+10. **Auto-purge**: non-ignored, non-protected, **non-grabby** videos with
+    `publishedAt` older than `autoPurgeDays` → delete folder + row; clear
+    `currentVideoId` if it was purged.
+
+Note the live deployment runs a tight profile (`maxHarvestDays=3`,
+`autoPurgeDays=30`, `limitEnabled=true 2 per 6h`, duration 15–720 min,
+64 kbps mono, grabby mix on at ratio 3) — see §10 for the full live values.
+
+---
+
+## 7. Video Discovery Details
+
+### 7.1 RSS
+
+`https://www.youtube.com/feeds/videos.xml?channel_id=UC…` fetched with a
+Chrome UA, 15 s timeout. Raw XML is cached to `cache/rss/<channelId>.xml`
+(used as fallback when live fetch fails, and for title resolution). YouTube
+RSS contains only the ~15 most recent uploads — the reason for the
+alternative method.
+
+### 7.2 The "alternative" method (yt-dlp tab scrape)
+
+`getLatestVideosAlternative()` scrapes the channel's **videos / streams /
+shorts** tabs (each toggleable in Settings) via:
+
+```
+yt-dlp <base> [--playlist-items 1-10] --break-on-reject
+  --extractor-args "youtubetab:approximate_date"
+  --dump-json --flat-playlist --dateafter <YYYYMMDD maxDays ago>
+  --ignore-errors https://www.youtube.com/channel/UC…/<tab>
+```
+
+(`--playlist-items 1-10` caps the harvest scrape; the ignore sweep omits it to
+walk the whole 2-year window.) Results are flat-playlist JSON lines →
+`{videoId,title,duration,link}`; de-duped and filtered against the channel's
+known video IDs.
+
+`getRssFeedWithCache()` flow, per run: the `UseAlternateListGetterMethod` flag
+is flipped every harvest, so **alternate runs alternate between**
+"live RSS first, alt fallback" and "alt first, RSS fallback, then cached XML".
+This hedges against either source rate-limiting the other.
+
+### 7.3 Metadata filling
+
+`fillMissingMetadata()` runs
+`yt-dlp --print '%(timestamp)s|%(duration_string)s|%(live_status)s'` for
+items missing pubDate/duration/liveStatus, with a **120 s timeout**
+(`safeExec`'s optional third arg kills a hung yt-dlp — one hung discovery
+call must not stall the whole harvest). Pub-date parsing applies the
+**today-midnight rule**: yt-dlp timestamps that land exactly on local
+midnight are treated as "now" (avoids off-by-a-day for fresh uploads).
+
+Outcomes — the skip paths log `⏭️ [videoId] …` instead of continuing
+silently (an unauditable "miss"):
+
+- empty `%(timestamp)s` → `res: false` →
+  "Incomplete metadata — will retry next cycle";
+- `live_status` ∈ `is_live` / `is_upcoming` → **`VODFuture`** →
+  "not downloadable yet, will retry next cycle" (genuinely not downloadable
+  — a scheduled stream becomes downloadable once its VOD is processed, at
+  which point yt-dlp reports `was_live` → `VODNow` and the download proceeds);
+- `live_status` = `post_live` → **not blocked** — YouTube frequently leaves an
+  ended stream flagged `post_live` long after its VOD is already served (stale
+  state), so it falls through to `downloadAndProcessVideo()`, which is the real
+  availability check: if the VOD is ready it downloads, if not the yt-dlp call
+  fails cleanly (no row written) and the item is retried next cycle;
+- success logs nothing by design.
+
+### 7.4 Ignore semantics
+
+`ignoreVideo()` = the tombstone mechanism: mark-or-create the row with
+`ignored: true`, delete any cache folder, regenerate the index. Ignored rows
+never enter `index.json`, never re-download (harvest dedupes on `videoId`
+before checking ignored), and are the reason the table holds 300k+ rows.
+
+---
+
+## 8. Cache Directory Layout (`cache/`)
+
+```
+cache/
+├── index.json                  # THE queue (non-ignored rows, merged w/ per-item JSON)
+├── grabby-index.json           # written by GRABBYTUBE — its catalog
+├── shufflebag.json             # shufflebag state (this app)
+├── rss/<channelId>.xml         # RSS fallback cache
+└── <videoId>/                  # one folder per item (DrivePod OR GrabbyTube)
+    ├── <videoId>.mp3           # final audio
+    ├── <videoId>-small.webp    # 400×225 thumbnail (DrivePod)
+    ├── <videoId>.jpg|webp      # original thumbnail (may be removed post-transcode? kept)
+    └── <videoId>.json          # rich metadata (DrivePod: videoInfo; GrabbyTube: own shape)
+```
+
+Corruption definition (per §5.7-2): a valid DrivePod folder has exactly one
+mp3, exactly one `{id}.json`, ≤2 image files, and is non-empty.
+
+---
+
+## 9. GrabbyTube Integration ("ShuffleBag")
+
+**Purpose**: mix a pre-downloaded MP3 music catalog into the podcast queue at
+a duration ratio, so the player is never silent.
+
+**State**:
+- `grabby-index.json` — written by GrabbyTube (single writer):
+  `{videoId, channelId, title, author, publishedAt: "YYYYMMDD", thumbnailPath, audioPath, duration, createdAt}`.
+- `shufflebag.json` — this app's FIFO state: `[{videoId, used}]`.
+- **`resolveGrabbyAudioPath(videoId, audioPath)`** — the single resolver
+  for grabby file paths: returns the literal path (absolute as-is, relative
+  joined to CACHE_DIR) when the file exists, else the canonical
+  `cache/<videoId>/<videoId>.mp3` when that exists, else the literal. Used
+  by init, distribute (pull + recondition) and the pre-insert recheck.
+  `grabby-index.json` is **never rewritten** by DrivePod — GrabbyTube owns
+  it, and its `audioPath` values go stale when its cache moves; we resolve
+  at read time.
+- **Per-artist placeholder channels** `UCGrabbyTube<base64url(author)>`
+  (title = the artist, inactive, `order 999999`). The SPA / car head unit
+  render `channel.title` as the artist (media-session metadata, queue rows,
+  page title), so grabby tracks show their real artist with **no MP3
+  re-tagging or re-encoding**. Bare `UCGrabbyTube` is the fallback for items
+  without an author. `DELETE` of any `UCGrabbyTube*` → 403, and the Settings
+  tab hides all `UCGrabbyTube*` channels (frontend filter in `loadChannels`).
+
+**Lifecycle**:
+
+- **Init** (boot): upsert the placeholder channel; load grabby-index, drop
+  defunct items (`resolveGrabbyAudioPath()` finds no file), Fisher–Yates
+  shuffle, persist. In
+  parallel, `backfillGrabbyArtistChannels()` re-points any grabby row still
+  on a stale channel (e.g. pre-migration rows on bare `UCGrabbyTube`) to its
+  per-artist channel using the index's `author`, and regenerates
+  `index.json` if anything moved. Idempotent.
+- **Pull** (`pullFromShuffleBag(n)`): take n `used:false` entries in bag order
+  (shuffled order = pseudo-random draw), mark used, persist. On exhaustion,
+  reinitialize **once** (reusing items is allowed — grabby tracks re-enter the
+  mix; see below).
+- **Reconcile** (`reconcileShuffleBag(returnIds, indexIds)`), once per run:
+  - candidates the plan did NOT place are un-used and moved to the **tail** of
+    the bag. A head-insert would starve the bag (an item too long for the
+    current deficit would be pulled and returned every 5 min, blocking every
+    shorter item behind it); marking them used — the old behavior — burns them
+    out of the rotation for a whole bag cycle, because `used` only resets on
+    re-initialization (1,985 entries).
+  - entries grabby-index.json no longer lists are **pruned**, `used` or not: a
+    `used` one is never pulled again, so without this it stays in the file
+    forever (the T1 A9 "stale bag entry" failure mode). Two guards: an empty
+    index set (missing/unreadable index) prunes nothing, and a **mass absence**
+    (> 10 % of the bag — smells like a partial index rewrite, not real
+    deletions) is logged but not pruned, since a pruned entry only rejoins
+    after a full ~23 h pass.
+- **Distribute** (after harvest, before auto-purge; skipped when
+  `grabbyMixEnabled=false` — **it is currently ON in the live deployment**,
+  ratio 1, cluster cap 7):
+  1. **Repair stranded rows FIRST**: any unwatched, unignored grabby row
+     timestamped **above** the anchor is re-clustered into the band
+     (`clusterTimestamp`). Those timestamps were invented by us, so moving them
+     is safe — and the tally must run after it, or the repaired file is invisible
+     to both the ratio and the cluster cap (it would be double-counted by the
+     next run's placement). Logs `🔧 Re-clustered N grabby item(s) …`.
+  2. **Measure the band**: the 60 minutes of queue content ENDING at the newest
+     **normal** video (`ignored:false, watched:false` — the queue excludes
+     watched rows, and only grabby depends on this function for replenishment).
+     Normal and grabby are tallied over that **one** window, counting both
+     `count` and `durationSec`.
+  3. **Target** (`grabbyTargets`): duration parity `normalDur/ratio` AND count
+     parity `normalCount/ratio`, each floored for quiet hours by
+     `max(…, 5 min if ratio ≤ 5 else 15 min)` applied to the **TARGET** — a
+     band that already meets its target is left alone, so the 5-min cron cannot
+     top it up over and over (the old per-run floor of `max(deficit, …)`
+     re-injected 36–180× the target per hour).
+  4. **Pull candidates**: `max(count deficit, ceil(budget / longest catalog
+     track)) + 5` (the +5 absorbs unusable entries). If
+     `grabbyClusterMaxSize > 0`, items already in the band count against the cap
+     **across runs**, so a run pulls only the remaining headroom and stops once
+     the band is full.
+  5. **Plan** (`planGrabbyFill`, pure + exported, deterministic — a run is
+     reproducible from its log line): which candidates to place, converging on
+     **both** targets at once. Hard: the slot cap, and the duration budget
+     (overrun by at most `GRABBY_OVERSHOOT_RATIO = 15 %`, and only on the final
+     item or to fill an empty cluster). Soft: the count target, widened toward
+     the fewest items that can still reach the budget, or narrowed to the most
+     that can fit it. Selection is best-fit-to-the-remaining-share per slot
+     (`ideal = (budget − placed) / slotsLeft`), candidates sorted ascending by
+     duration with a `videoId` tie-break.
+     - **Why both targets**: duration parity alone is what made a cluster look
+       complete while the user saw one or two items — a single 80-minute
+       archive file satisfies a 45-minute budget outright, and the old loop
+       stopped the instant the duration was covered. Count parity is what forces
+       the same budget across several tracks.
+  6. Place the plan's picks (re-verifying each file via
+     `resolveGrabbyAudioPath()`):
+     - **already in DB → "recondition"**: update row with clustered
+       `publishedAt` (`clusterTimestamp` = uniform inside the band, i.e. **at or
+       below** the newest normal video), fresh title/thumb/duration,
+       `watched:false, progress:0`, the resolved `audioPath` (literal index path
+       if its file exists, else canonical), and re-point to the per-artist
+       channel if `author` changed — the track cycles back into the mix window;
+     - **not in DB → insert** with `isGrabby:true, protected:false`,
+       `channelId` = the per-artist placeholder channel derived from the
+       index `author` (bare `UCGrabbyTube` when absent).
+  7. Final pre-insert recheck for files deleted mid-harvest (a concurrent
+     grabby delete), then `createMany` + `updateIndexFile()`.
+
+**The band window is the load-bearing invariant** (`GRABBY_BAND_LOOKBACK_MS`):
+measuring grabby up to `+30 min` **above** the anchor (the jitter ceiling the old
+code used, while normal was measured only up to the anchor) inflated grabby,
+because no normal video can exist above the anchor by definition. Live example
+captured 2026-11-12: band anchored at 07:37 with 1 normal item (2594 s) — the
+old windows read normal 2594 s vs grabby **4832 s** → "ratio satisfied", while
+that one 80-minute file sat at the very **top** of the queue, above all the
+newest normal content, and nothing was placed. The same band measured
+symmetrically reads grabby **0 s** → a 2594 s deficit → one best-fit track
+placed inside the band.
+
+**Guard rails** (the `isGrabby` safety rule):
+
+- Auto-purge and purge-all filter `isGrabby:false`.
+- Channel delete skips grabby rows.
+- `cleanupCorruptedFolders` preserves grabby **files** (deletes DB row only).
+- `updateIndexFile` self-heals grabby rows whose mp3 vanished.
+- Every `deleteMany` on non-grabby videos carries `isGrabby:false` — audit
+  any new delete path for this.
+
+**Consume-and-delete** (`DELETE /api/video/:videoId/grabby`):
+
+- 404 unknown, 400 non-grabby.
+- **Remote first, fail-closed**: `DELETE http://grabbytube:8101/tracks/<id>`
+  with `X-Grabby-Token` (shared secret `GRABBY_API_TOKEN` in both projects'
+  env). Remote 200/404 → proceed; anything else → 502 and **nothing local is
+  touched** (GrabbyTube is the single writer of its catalog/index/files).
+- Local: delete the DB row (`isGrabby:true` scope), prune the shufflebag entry,
+  regenerate the index.
+- **No harvest/import concurrency lock** on purpose (user decision); the
+  delete-during-harvest race is neutralized by the index self-heal + the
+  pre-insert recheck.
+- Frontend: 🗑️ button in the now-playing bar (grabby tracks only) and the
+  **Delete** hotkey, both calling `consumeGrabbyTrack()` with no confirmation;
+  success advances to the next track via `markAsWatchedAndPlayNext()`.
+
+**Recovery if grabby rows get wiped**: delete `cache/shufflebag.json` (fresh
+reinit next harvest); grabby-index.json and the MP3s are untouched.
+
+---
+
+## 10. Configuration Reference
+
+### 10.1 DB-backed config (Settings tab → `POST /api/config`)
+
+| Key | Default | Live value (2026-10-16) | Meaning |
+|---|---|---|---|
+| `maxHarvestDays` | 7 | **3** | discovery window (pub-date filter also uses this) |
+| `preferredBitrate` | 128 | **64** | MP3 kbps (UI: 32/48/64/96/128/160/192) |
+| `preferredMono` | false | **true** | `-ac 1` in transcode |
+| `autoPurgeDays` | 30 | 30 | auto-purge age cutoff |
+| `userAgent` | Chrome/134 Win | Chrome/153 X11 | yt-dlp `--user-agent` |
+| `cookies` | '' | '' | uploaded/pasted cookies (shared export overrides) |
+| `limitEnabled` | false | **true** | per-channel X-per-Y-hours limit |
+| `limitVideos` | 2 | 2 | X |
+| `limitHours` | 6 | 6 | Y |
+| `alternativeMetadataEnabled` | true | true | enable the yt-dlp tab scrape method |
+| `scrapeVideosTab` | true | true | videos tab |
+| `scrapeStreamsTab` | true | true | streams tab |
+| `scrapeShortsTab` | true | false | shorts tab |
+| `durationFilterEnabled` | false | **true** | global min/max filter |
+| `minDurationMinutes` | 0 | **15** | global min |
+| `maxDurationMinutes` | 720 | 720 | global max |
+| `grabbyMixEnabled` | true | true | shufflebag on/off |
+| `grabbyMixRatio` | 3 | **1** | normal:grabby ratio — drives BOTH parity targets (duration AND item count) in the band (§9) |
+| `grabbyClusterMaxSize` | 0 | **7** | hard cap on grabby items in the 60-min band, counted across runs (0 = unlimited) |
+| `currentVideoId` | '' | w2drTBjfUk0 | last played video (resume target) |
+
+Per-channel overrides live on the Channel row (`minDuration`/`maxDuration`,
+both null = global; **any override present enables the filter for that
+channel even when the global toggle is off**).
+
+**Dead keys** (still in the live DB, read by no code — leftovers from
+superseded versions): `alternativeMetadataFetchEnabled`,
+`consumedGrabbyIds`, `consumedGrabbySeed`, `onePerHours`, `scrapeTabTypes`.
+
+### 10.2 Client-side settings (localStorage, not in DB)
+
+| Key | Meaning |
+|---|---|
+| `drivepod-lowBandwidth` | hide thumbnails (56k mode) |
+| `drivepod-autoplayMode` | `newest` \| `newer` \| `older` \| `oldest` \| `off` (migrated from legacy `next`→`older`, `none`→`off`) |
+| `drivepod-skipMarksWatched` | treat next-skip as track completion |
+
+### 10.3 Environment variables (`.env` → container)
+
+| Var | Used by | Notes |
+|---|---|---|
+| `CACHE_DIR` / `DATA_DIR` / `DATABASE_URL` | backend | required — backend exits if missing |
+| `NGINX_PORT` (default 24320) / `VPS_IP` (default 0.0.0.0) | compose | host port map |
+| `WG_PRIVATE_KEY` / `WG_ADDRESS` / `WG_DNS` / `WG_PEER_PUBLIC_KEY` / `WG_PEER_ALLOWEDIPS` / `WG_PEER_ENDPOINT` / `WG_PEER_PERSISTENT_KEEPALIVE` | entrypoint | WireGuard client; tunnel skipped if the three required vars are absent |
+| `GRABBY_API_TOKEN` | backend | shared secret for the remote grabby delete |
+
+---
+
+## 11. Backend API Reference
+
+**All routes are unauthenticated** (auth was removed 2026-08-23, commit
+`b7664c0`). Anyone who can reach the port can call the full API, including
+destructive routes. Access control is the WireGuard perimeter + network
+topology. There are no `/api/auth/*` routes; the `requireAuth` middleware
+referenced in older docs does not exist.
+
+### Status & config
+
+| Method | Path | Behavior |
+|---|---|---|
+| GET | `/api/harvest-status` | live `harvestStatus` object |
+| GET | `/api/config` | all config keys, parsed (see §10.1 shape) |
+| POST | `/api/config` | partial update; only explicitly-listed fields persisted |
+| POST | `/api/cookies` | multipart `cookies` file → stored in DB |
+
+### Channels
+
+| Method | Path | Behavior |
+|---|---|---|
+| GET | `/api/channels` | all channels ordered by `order` |
+| POST | `/api/channels` | `{channelId,title?}` upsert; auto-fetches title from RSS when missing/`Unknown Channel`; assigns next `order` |
+| PATCH | `/api/channels/:channelId/active` | `{active}` |
+| PATCH | `/api/channels/:channelId/duration` | `{minDuration?,maxDuration?}` (null clears) |
+| POST | `/api/channels/reorder` | `{channelIds:[…]} → order = array index` |
+| POST | `/api/channels/import` | legacy: `{channelIds:[…]}` (RSS title fetch, 800 ms pacing) |
+| DELETE | `/api/channels/:channelId` | refuses any `UCGrabbyTube*` placeholder (403); deletes channel's non-grabby videos (folders + rows), RSS cache, clears `currentVideoId` if affected, regenerates index |
+
+### Import (mixed)
+
+| Method | Path | Behavior |
+|---|---|---|
+| POST | `/api/import` | `{items: string[]}` — mixed channel IDs / channel URLs / video URLs. 409 if harvest or import in flight. Phase 1 classify (below); Phase 2 channels (handle→UC resolution via yt-dlp; existing→skipped); Phase 3 videos (resolve channel from video, create **inactive** channel if new, `importSingleVideo`). 500 ms pacing. |
+
+`classifyYouTubeUrl()` handles: `UC…` IDs, `watch?v=`, `youtu.be/`,
+`/shorts/`, `/channel/`, `@handle`, `/c/`, `/user/`. **Fallback: anything
+unrecognized is treated as a channel ID** — a stale container running old code
+will silently store URLs as channel IDs (rebuild before testing import
+changes).
+
+`importSingleVideo()`: existing/ignored video → unignore + protect; if the DB
+`audioPath` and folder exist on disk → `already-exists` (no re-download);
+otherwise re-download, then `upsert` (preserving the original `publishedAt`).
+
+### Playback state
+
+| Method | Path | Behavior |
+|---|---|---|
+| PATCH | `/api/video/:videoId/progress` | set progress (int seconds); also sets `currentVideoId`; clears `currentVideoId` if the row is gone |
+| POST | `/api/video/:videoId/watched` | mark watched=true (track finished); regenerates index |
+| PATCH | `/api/video/:videoId/watched` | toggle to given value; regenerates index; clears `_localWatched` hold on the client |
+| PATCH | `/api/video/:videoId/protect` | 404 if unknown; sets protected; regenerates index |
+| GET | `/api/player/current` | `{videoId: <currentVideoId> \| null}` |
+| PATCH | `/api/player/current` | `{videoId}` — persist last played |
+
+### Media
+
+| Method | Path | Behavior |
+|---|---|---|
+| GET | `/api/stream/:videoId` | streams the mp3 for any row (incl. grabby) whose file exists; 404 otherwise. **HEAD is auto-served** (Express) — the frontend's defunct-vs-transient probe relies on this. `?bitrate=` / `-mono` query params sent by the SPA are **ignored** (files are pre-transcoded at harvest time). |
+| GET | `/cache/…` (nginx) | static: mp3 (immutable 7 d), images (1 d), index.json (no-store, application/json) |
+
+### Destructive / interop
+
+| Method | Path | Behavior |
+|---|---|---|
+| POST | `/api/purge-all` | delete all non-ignored, non-protected, **non-grabby** rows + folders; regenerates index |
+| DELETE | `/api/video/:videoId/grabby` | consume-and-delete a grabby track (remote-first, fail-closed; §9) |
+
+---
+
+## 12. Frontend (`frontend/src/app/`)
+
+Single standalone `AppComponent` (selector `app-main`) under a one-route
+router. Angular 21 + Tailwind; signals for all state; no RxJS in the component
+except `HttpClient` subscriptions. Dark, mobile-first, car-optimized UI.
+
+### 12.1 Tabs (signal `activeTab`, no router)
+
+| Tab | Content |
+|---|---|
+| 🚶 Queue | paged list (PAGE_SIZE 20, IntersectionObserver infinite scroll, 400 px rootMargin) of unwatched non-ignored videos newest-first; thumbnail, channel, "x ago", duration, progress bar, 🔒 protect toggle, YouTube link (deep-links at the current scrubber second), ▶ play |
+| 📡 Harvest | live panel polling `/api/harvest-status` every 4 s while the tab is open: running badge, per-channel action (Ignore Sweep / Fetching RSS / Downloading / Transcoding), counters |
+| ⚙️ Settings | all §10.1 controls; channel list with rename, 🟢/⏸️ active toggle, per-channel min/max duration editor, ↑↑ ↑ ↓ ↓↓ reorder, delete; cookies upload/clear; low-bandwidth, autoplay mode, skip-marks-watched; grabby mix toggle + ratio slider (1–20); **Purge All** (confirm dialog) |
+| 📥 Import | paste box (mixed channel/video inputs), 10-minute HTTP timeout, per-item added/skipped/failed results; 409 → "Harvest or import already running" |
+| 🔒 Protected | protected videos; lock/unlock; play |
+| 👁️ Watched | watched history; unwatch (re-queues); play |
+
+Now-playing bar (bottom, always visible when a track is loaded): title,
+channel, scrubber (drag = `isScrubbing`, no progress saves while scrubbing),
+prev/play-next controls, 🗑️ (grabby only), external YouTube link at the
+current position, progress time labels.
+
+### 12.2 Data flow
+
+- **Source of truth for the queue is `cache/index.json`**, fetched via
+  `loadIndex()` (cache-busted, `no-store`). No `/api/playlist*` endpoints
+  exist.
+- `mergeIndexWithLocal()`: **server index is authoritative for watched
+  state**, except the `_localWatched` set — tracks marked watched locally
+  whose POST is still retrying stay out of the queue until the server
+  persists (this prevents played tracks from resurrecting on the 2-min poll
+  during network blackholes). Progress: local wins only over a zero server
+  value.
+- `derivePlaylists()` rebuilds `playlist` (page 0), `protectedPlaylist`,
+  `watchedPlaylist` from `rawIndex` and **resets `queuePage`** (stale-page
+  guard after the IntersectionObserver race).
+- Auto-refresh: `loadIndex()` every **2 minutes** while the SPA is open.
+- Every video object carries `channel: {title}`.
+
+### 12.3 Player engine
+
+`playVideo(v)` → `_tryPlay`:
+
+1. **HEAD probe** `/api/stream/<id>` before touching the `<audio>` element:
+   - 200 → `_loadAndPlay` (set src, seek to the `stallResumeTarget` position
+     if <98% of duration, `play()` — see the watchdog below);
+   - 404 → **defunct**: `_skipDefunctTrack` (local-watched hold, remove from
+     playlist, POST watched, advance);
+   - unreachable/other → `_probeAndPlay`: exponential backoff
+     (3 s × 1.5^n, cap 30 s), **indefinite** until 200 or 404.
+2. `play()` rejection: `NotAllowedError` = autoplay policy (stay paused,
+   ready for gesture); anything else → probe again; on persistent failure
+   stop the player and `advanceToNextTrack()`.
+3. `audio.onerror` (fires for both 404 and network loss) → same HEAD probe:
+   404 skip, 200 reload, unreachable do nothing (probe loop owns retry).
+
+**Autoplay on load**: first successful `loadIndex()` triggers
+`_attemptInitialAutoplay()` — resumes `currentVideoId` if present, else
+`oldest`→last else first; `play()` may be policy-blocked (fine).
+
+**Autoplay modes** (after a track ends — `markAsWatchedAndPlayNext` →
+`getCandidate(playlist, mode, finishedTime, finishedId)`): `newest` (top of
+queue, reload index when empty), `newer`/`older` (by publishedAt relative
+to the finished track), `oldest` (bottom), `off` (stop). The finished track
+is excluded by `videoId`, and the `newer`/`older` comparisons are
+`<=`/`>=` (not strict) so same-timestamp siblings (batched imports, grabby
+clusters) stay reachable — a strict `<`/`>` could strand the player at a
+shared timestamp.
+
+**Skip semantics**: `skipNext()` = jump without marking watched, unless
+`skipMarksWatched` is on → full completion path. `skipPrevious()` at index 0
+replays from 0 (and re-arms the playing-before-drop flag).
+
+**Hide ⇒ stop invariant**: every path that sets `currentVideo` to null also
+does `audio.pause(); audio.src=''; setMediaPlaybackState('none')` (enforced by
+an `effect()` in the constructor) — a hidden player must not keep playing.
+
+**Playback liveness watchdog — silent starvation** (`frontend/src/app/stall-guard.ts`
+holds the pure decision; `_runStallCheck()` in `app.component.ts` executes it
+after every connectivity-probe verdict, so it needs no timer of its own):
+
+- Liveness heartbeat = `timeupdate` (~4 Hz on a playing MP3): `lastProgressAt`
+  is the wall clock of the last audible advance. It is re-armed on every fresh
+  load, which self-serializes the attempts — no separate per-attempt clock.
+- Silence past `STALL_DETECT_MS` (20 s = 5 × the heartbeat cadence) while the
+  element claims to play → phase `stalling` → **recovery reload**: the same
+  track via a **NEW HTTP request**. Re-assuming the buffer is a no-op —
+  `load()` aborts the outstanding fetch but Chromium keeps the buffered
+  ranges, so playback resumes from the retained window and re-stalls at its
+  edge, forever. Only setting `src` opens a new connection.
+- `readyState` NEVER suppresses a recovery: a half-open media socket keeps a
+  full buffer (`readyState 4`), which the old gate (`!paused && readyState >= 2`)
+  read as perfectly healthy. The 2026-11-11 incident proved the wedge:
+  `HEAD /api/config` and `PATCH /api/video/:id/progress` kept answering 200 for
+  40 minutes while the one media socket egressed and received nothing — so
+  `backendOnline` never flipped, the outage machinery never ran, no badge
+  appeared, and `audio.onerror` never fired (a stalled socket raises no error).
+  A half-open pipe is therefore detected by **absence of progress**, and the
+  watchdog's fresh request is what actually repairs it.
+- Give-up: `MAX_STALL_RECOVERIES` (3) fresh loads per track, then
+  `_skipDefunctTrack()`. Any audible progress clears the count, so only a track
+  that never plays again is abandoned; a flaky link that keeps recovering is not.
+- **Resume target** (`stallResumeTarget`): the element's own `currentTime` once
+  metadata has landed (`readyState >= HAVE_POSITION_READY_STATE` = 1) — the
+  listener is ~10 s ahead of the 10 s-throttled `progress` the index knows —
+  else the index copy (the element has no position before metadata, and
+  `currentTime` is 0 there). Computed BEFORE `src` is re-assigned: the load
+  algorithm wipes the playback position the moment a new source is set. A resume
+  at 0 with a 28 MB retained buffer replays ~6 min at 64 kbps mono.
+- Clock trust: a frozen/suspended tab runs its timers ~1/min, so a stale
+  heartbeat proves nothing there; `visibilitychange` / `resume` own that
+  decision and are granted a shortened budget (`RESUME_DETECT_MS` 6 s).
+  `navigator.mediaSession.playbackState === 'playing'` keeps the clock trusted
+  while the page is hidden but audible (lockscreen, car head-unit).
+- Only watchdog-issued loads (`_stallLoadOutstanding`) may be retried, so a
+  playback blocked by the autoplay policy is never reloaded forever.
+- UI: the `playbackPhase` signal drives a `role="status" aria-live="polite"`
+  badge — `⏳ Buffering…` / `⏳ Reconnecting…` — the only visible sign any of
+  this happened (`idle` renders nothing; silent starvation used to render nothing
+  at all, which is why "the app just stopped and nothing said why").
+- Test: `node tests/stall-guard.test.mjs` (45 assertions, no browser and no
+  network: the pure decision plus both resume clocks, driven on simulated ticks
+  — including the `readyState 4` stale buffer, a load that never answers, the
+  give-up cadence, and scrubbing/paused/frozen-tab immunity).
+
+### 12.4 Progress persistence
+
+- `ontimeupdate` → throttled save every **10 s**; onseeked → 300 ms debounce;
+  onpause/onended/beforeunload → immediate.
+- Saves are int seconds; deduped per (videoId, int).
+- Failed saves → operation queue (§12.5).
+- `saveCurrentVideo()` PATCHes `/api/player/current` on every track start
+  (fire-and-forget).
+
+### 12.5 Network resilience (the car-environment design)
+
+- **Operation queue**: `{videoId, type: 'watched'|'progress'}` — progress
+  dedupes to latest per video; watched dedupes per video. Exponential backoff
+  2 s × 2^n cap 60 s, max 10 attempts, then dropped (logged).
+- **Always-on probe**: `HEAD /api/config` every 5 s. 3 consecutive failures =
+  unreachable → `_snapshotPlaybackStateOnDrop()` records
+  `_wasPlayingBeforeDrop` (from `audio.paused`/`audio.error` + currentVideo).
+- **On recovery**: flush pending ops; resume any pending playback retry
+  immediately; reload audio **only if it was playing before the drop**
+  (`recoverAudioPlayback()` — a paused track stays paused). Explicit play
+  intents (play button, head-unit play, replay-from-start) set
+  `_wasPlayingBeforeDrop=true` so they resume too.
+- `window.online` is treated as unreliable (fires on NIC-up, not
+  internet-up) — it only triggers a probe.
+- **Index fetch deferral**: failed `loadIndex()` sets `backendOnline=false`;
+  the 2-min poll and autoplay fetches defer (`indexFetchPending`) until the
+  probe confirms reachability. Failed fetches never overwrite in-memory state
+  with browser cache.
+- **UI/network decoupling rule**: state transitions (track end, skip, hide)
+  update signals synchronously; the HTTP call is fire-and-forget + queued.
+
+### 12.6 Media Session (phone lockscreen / car head-unit)
+
+- `metadata` from the current video (title, channel as artist, thumbnail as
+  artwork); `playbackState` kept in sync; `setPositionState` (duration,
+  position, rate) throttled to **1.8 s** — this is what renders the Ford Sync
+  style progress on car displays.
+- Handlers: play (re-arms playing flag), pause, `nexttrack` → `skipNext()`
+  (so head-unit next respects `skipMarksWatched`), `previoustrack` →
+  `skipPrevious()`.
+
+### 12.7 Keyboard shortcuts (input-field guarded)
+
+| Key | Action |
+|---|---|
+| ← / → | seek ∓10 s |
+| Delete | consume current grabby track (no confirm) |
+
+### 12.8 Known client-side oddities (honest list)
+
+- `importChannels()` splits the paste on the **literal two-character
+  sequence `\\n`**, not newlines (`rawText.trim().split('\\n')` in a non-raw
+  string). Multi-line pastes are therefore treated as one blob (works for
+  space/comma-free single lines only). The backend's classifier would then
+  fallback-classify the whole string as a "channel ID". Fix when touched.
+- Stream URL sends `?bitrate=…` and `-mono` suffix that the backend ignores
+  (§11) — cosmetic; the file is what the file is.
+- `probeBackend()`'s recovery branch doesn't handle the 401-as-reachable case
+  the way `_doConnectivityProbe()` does (harmless now — there is no auth —
+  but don't copy that pattern if auth returns).
+- `initializeCurrentVideo()` is unused (initial autoplay is handled by
+  `_attemptInitialAutoplay`).
+- Dead code: nothing auth-related exists client-side anymore; the skill's
+  historical `AuthService`/guards/interceptor references predate the
+  auth-removal commit.
+
+---
+
+## 13. Deployment & Operations
+
+### 13.1 Build & deploy (the only correct sequence)
+
+```bash
+cd /home/user/projects/DrivePod
+docker compose build
+docker compose create --force-recreate
+docker compose start
+```
+
+`docker compose up -d --build` is blocked by the terminal tool's server
+detection; `create --force-recreate` **without** `build` recreates from the
+stale image (classic "my change isn't there" bug). No code changes →
+`docker restart drivepod` is enough. Logs: `docker compose logs --tail=30
+drivepod`.
+
+Verify running code (examples):
+`grep -c "classifyYouTubeUrl" backend/dist/server.js` (source truth),
+`grep -n "videoId: 'asc'" /app/backend/dist/server.js` (in container).
+
+### 13.2 External endpoints (host-level nginx + <dns-provider> DNS)
+
+- `drivepod.example.com` → VPS → `10.99.0.229:80` over WireGuard (WG address
+  from `.env`; the container's own WG peer config is the client side).
+- `grabbytube.example.com` → `10.99.0.234:8101` (sibling project).
+- `ytcookies.example.com` → `10.99.0.240:8300` (noVNC cookie exporter; the
+  source of `/shared-cookies/cookies.txt`).
+
+Useful verifications:
+
+```bash
+curl -sI https://drivepod.example.com/cache/index.json   # must be:
+  Content-Type: application/json
+  Cache-Control: no-store, no-cache, must-revalidate, max-age=0
+docker exec drivepod yt-dlp --cookies /shared-cookies/cookies.txt \
+  --skip-download --print "%(id)s" <video-url>          # cookie health
+docker exec drivepod curl -s http://drivepod-bgutil:4416/ping  # sidecar
+```
+
+### 13.3 WireGuard notes
+
+- Container = WG **client** (one peer = the VPS server). `WG_ADDRESS` live:
+  `10.99.0.229/32`; DNS `10.99.0.42` inside the tunnel.
+- ⚠️ **Live `.env` sets `WG_PEER_ALLOWEDIPS=0.0.0.0/0`** — the `.env.example`
+  warns this causes routing loops inside Docker (WG control packets routed
+  through wg0). It works in the current deployment, but treat the example's
+  `10.99.0.0/20` as the intended value and revisit if tunnel behavior
+  degrades.
+- The `privileged` + caps + sysctls + `/lib/modules` mount in compose exist
+  solely for this.
+
+### 13.4 Line endings
+
+Repo is normalized to **LF** (commit `c6a99e9`; `.gitattributes`
+`* text=auto eol=lf`). Older skill notes about CRLF are stale — normal
+`patch`/`write_file` edits are fine now.
+
+### 13.5 Common failures (runbook)
+
+| Symptom | Cause → fix |
+|---|---|
+| Playlist order changes between refreshes with no state change | missing `videoId asc` tiebreaker in `updateIndexFile` (fixed; verify in dist) |
+| Queue renders empty | index.json not `application/json` (nosniff kills `.json()`), or fetch failing → check the nginx exact-match block + `backendOnline` |
+| `Only images are available` / format 403 on downloads | bgutil sidecar off the `shared` network → `docker network connect shared drivepod-bgutil`; or PO-token/cookie issue (INTELLIGENCE.md triage) |
+| Every download 403 (audio-only) | datacenter format-403 → ensure the combined-stream `-f` filter is in `getBaseYtDlpCommand` |
+| Import stores URLs as channel IDs | stale container (old `classifyYouTubeUrl` fallback) → rebuild |
+| Harvest and import stomp on each other | the `isHarvesting`/`isImporting` pair — never remove one without the other |
+| Grabby items wiped by a purge | any new delete path missing `isGrabby:false` (skill's safety rule) |
+| SQLite 2570 disk I/O error | Windows process holding `data/database.db` open (drvfs); recover via `.dump` → restore → `PRAGMA integrity_check` (skill `sqlite-corruption-recovery`) |
+| Watched tracks flicker back in | the `_localWatched` guard in `mergeIndexWithLocal` was dropped |
+| Playback dies mid-item: no badge, no error, only a new tab fixes it | half-open media socket — the backend answers every NEW request (`HEAD /api/config` → 200) so `backendOnline` never flips and no outage path runs, while the one `/api/stream` connection keeps delivering nothing. Caught since 2026-11-11 by the §12.3 liveness watchdog (badge + new-request reload + resume where the listener stopped); a track that never plays again is skipped after 3 loads |
+
+---
+
+## 14. Security Posture (as-is, honest)
+
+- **No application auth.** All API routes are open; the only perimeter is
+  WireGuard + the VPS nginx. Anything bound to this port on a non-VG network
+  is fully writable (purge-all, channel delete, cookie read).
+- **Cookies at rest**: the DB `cookies` config holds the raw Netscape cookie
+  file content; `/shared-cookies/cookies.txt` is a live mount of a logged-in
+  YouTube session. Both are readable by anything in the container.
+- **`.env` is world-readable** (`777`) on the drvfs mount and contains the WG
+  private key + `GRABBY_API_TOKEN` (it is git-ignored; the shared risk is
+  local/WSL access and the 777 mode).
+- **No auth on the stream endpoint** — audio is streamable by URL to anyone
+  who can resolve the hostname (acceptable for a personal deployment; the
+  content is the user's own subscription).
+- The `X-Grabby-Token` shared-secret pattern is the only inter-service auth
+  in the stack.
+- index.json carries full video metadata + DB internals (cuid ids,
+  createdAt) — fine over the VPN, keep it that way.
+
+If auth is ever re-added: backend middleware from scratch (none exists),
+the stream endpoint needs `?token=` support (audio `<src>` can't send
+headers), and the always-on probe must send it too.
+
+---
+
+## 15. Design Invariants (don't break these)
+
+1. **`index.json` is the queue's source of truth.** Every DB mutation that
+   affects queue membership calls `updateIndexFile()`. New mutation paths
+   must too.
+2. **Deterministic ordering**: `publishedAt desc, videoId asc` in the index.
+3. **Server-authoritative watched state** + the `_localWatched` hold for
+   in-flight completions.
+4. **`isGrabby` safety**: files preserved on corruption, rows self-healed in
+   the index, never touched by purge paths, never deleted with a
+   non-grabby `deleteMany`.
+5. **UI state never waits on the network**; all state transitions are
+   synchronous, all HTTP is fire-and-forget + retried.
+6. **Hidden player ⇒ stopped audio** (the `effect()` + explicit paths).
+7. **Harvest/import mutual exclusion** protects cache folders from orphan
+   cleanup.
+8. **Combined-stream download format** is load-bearing (datacenter 403s).
+9. **Single writer per file**: GrabbyTube writes `grabby-index.json` +
+   grabby folders' canonical state; DrivePod writes `index.json` +
+   `shufflebag.json`. The remote-first fail-closed delete keeps that intact.
+10. **yt-dlp flags live only in `getBaseYtDlpCommand()`** (plus the download
+    extras) — keep it the single source when matching GrabbyTube.
+11. **`publishedAt` is pinned to the DB in `index.json`** for every item —
+    per-item JSON wins for everything else, never for ordering.
+12. **Playable = resolvable file**: stale `audioPath` values are healed at
+    read/cleanup time (DrivePod rows in `cleanupCorruptedFolders`, grabby
+    rows via `resolveGrabbyAudioPath()`); DrivePod never rewrites
+    `grabby-index.json`.
+
+---
+
+## 16. Live Deployment Snapshot (2026-10-16)
+
+- Containers up 3+ days: `drivepod` (24320→80), `drivepod-bgutil` (4416),
+  `grabbytube` (8101), `grabbytube-bgutil` (4416).
+- DB: 768 channels, 308,749 video rows — 307,157 ignored, 1,592 non-ignored
+  (the `index.json` set); 716 of those non-ignored are `isGrabby:true`;
+  1,016 unwatched (527 non-grabby) — the playable queue. 25 config rows
+  (20 live + 5 dead).
+- Cache: 1,624 video folders; `index.json` 1,592 items; `progress.json`
+  (split from the index — in-queue resume positions only) ~1.5 KB;
+  `grabby-index.json` 1,002 items — 36 point at files that no longer exist
+  (their DB rows are ignored; init/resolver/recheck exclude them);
+  `shufflebag.json` 966 entries (956 unused).
+- Profile: 3-day harvest window, 30-day auto-purge, 64 kbps mono, 2 videos
+  per channel per 6 h, 15–720 min duration, shorts tab off, grabby mix
+  **on** (ratio 3, cluster cap 3), Chrome/153 UA.
+
+*End of ARCHITECTURE.md.*

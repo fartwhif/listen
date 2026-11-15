@@ -1,0 +1,76 @@
+server {
+    listen 80;
+    server_name _;
+
+    # Gzip text-ish responses. The http-level nginx.conf has `gzip on` but
+    # the default gzip_types is text/html only, so the up-to-1MB index.json
+    # and the 350KB main-*.js bundle went out raw on every poll. Level 5
+    # takes index.json from ~1.06MB to ~180KB on the wire; gzip_proxied
+    # covers the /api/ JSON the frontend also fetches.
+    gzip on;
+    gzip_vary on;
+    gzip_comp_level 5;
+    gzip_min_length 1024;
+    gzip_proxied any;
+    gzip_types text/plain text/css application/json application/javascript
+        text/xml application/xml application/xml+rss text/javascript
+        image/svg+xml;
+
+    # SPA shell. The HTML must revalidate on every load (no-cache) or
+    # browsers serve the previous deploy's index.html from heuristic
+    # cache and never pick up the new hashed bundle.
+    location / {
+        root /var/www/drivepod;
+        try_files $uri $uri/ /index.html;
+        add_header Cache-Control "no-cache" always;
+    }
+
+    # Content-hashed assets are immutable — cache for a year. Regex wins
+    # over the plain prefix above; /api/ and /cache/ never match this.
+    location ~* ^/(main|chunk|polyfills|runtime|styles)-[A-Za-z0-9_-]+\.(js|css)$ {
+        root /var/www/drivepod;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    # Live playlist index (index.json) + live progress overlay
+    # (progress.json) — both regenerated on state changes. Never serve them
+    # stale, but make unchanged polls free: no max-age, so the browser
+    # revalidates on every request, and nginx's per-file ETag
+    # (inode/mtime/size) yields a 304 when the file was not regenerated.
+    # A regenerated file gets a new ETag, so the new version is always
+    # downloaded. The backend skips no-op rewrites to keep the ETag stable
+    # across unchanged harvest cycles. Regex wins over the /cache/ prefix
+    # block below; MP3s + thumbnails keep their normal (cacheable) treatment.
+    location ~ ^/cache/(index|progress)\.json$ {
+        alias /cache/$1.json;
+        etag on;
+        add_header Cache-Control "no-cache" always;
+        add_header Cross-Origin-Resource-Policy "cross-origin" always;
+        add_header Access-Control-Allow-Origin "*" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        default_type application/json;
+    }
+
+    location /cache/ {
+        alias /cache/;
+        add_header Cross-Origin-Resource-Policy "cross-origin" always;
+        add_header Access-Control-Allow-Origin "*" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        types {
+            image/jpeg  jpg jpeg;
+            image/png   png;
+            image/webp  webp;
+            image/gif   gif;
+            audio/mpeg  mp3;
+            application/json json;
+        }
+        default_type application/octet-stream;
+    }
+}

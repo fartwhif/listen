@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GrabbyTube</title>
+<!-- Relative so the page works when the hub gateway mounts this UI under a
+     prefix (/l/<slug>/grabby/): a root-absolute ref there escapes to the
+     portal root, which serves the picker and has no /static. Unprefixed
+     (today's own container served at /) resolves to the same path. -->
+<link rel="stylesheet" href="static/css/style.css">
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>GrabbyTube</h1>
+    <p class="subtitle">Search &rarr; Queue &rarr; MP3</p>
+    <div class="stats">
+      <span id="track-count">0 tracks</span>
+      <span id="queue-count">0 queued</span>
+    </div>
+  </header>
+
+  <!-- Search -->
+  <section id="search-section">
+    <h2>Search</h2>
+    <form id="search-form">
+      <input type="text" id="search-input" placeholder="Enter song name..." autocomplete="off" required>
+      <button type="submit" id="search-btn">Search</button>
+    </form>
+    <div id="search-results" class="results-list"></div>
+  </section>
+
+  <!-- Playlist Queue -->
+  <section id="playlist-section">
+    <h2>Enqueue Playlist</h2>
+    <form id="playlist-form">
+      <input type="text" id="playlist-input" placeholder="Paste YouTube playlist URL..." autocomplete="off" required>
+      <button type="submit" id="playlist-btn">Queue Playlist</button>
+    </form>
+    <div id="playlist-status"></div>
+  </section>
+
+  <!-- Batch Queue -->
+  <section id="batch-section">
+    <h2>Batch Queue</h2>
+    <textarea id="batch-input" placeholder="Paste YouTube URLs (one per line or space-separated)..."></textarea>
+    <button type="button" id="batch-btn">Enqueue All</button>
+    <div id="batch-status"></div>
+  </section>
+
+  <!-- Queue -->
+  <section id="queue-section">
+    <h2>Queue <span id="queue-badge"></span></h2>
+    <div class="queue-actions">
+      <button class="btn btn-secondary btn-clear-jobs" id="clear-jobs-btn">Clear Done/Failed</button>
+      <button class="btn btn-secondary btn-clear-completed" id="clear-completed-btn">Clear Successful</button>
+      <button class="btn btn-danger btn-clear-all" id="clear-all-btn">Clear All</button>
+    </div>
+    <div id="job-list" class="results-list"></div>
+  </section>
+
+  <!-- Tracks -->
+  <section id="tracks-section">
+    <h2>
+      Library
+      <select id="sort-select">
+        <option value="createdAt">Date Added</option>
+        <option value="title">Title</option>
+        <option value="author">Author</option>
+        <option value="publishedAt">Published</option>
+        <option value="duration">Duration</option>
+      </select>
+    </h2>
+    <div class="library-actions">
+      <button class="btn btn-secondary" id="select-all-btn">Select All</button>
+      <button class="btn btn-secondary" id="select-untuned-btn">Select UnTuned</button>
+      <button class="btn btn-secondary" id="find-duplicates-btn">Find Duplicates</button>
+      <button class="btn btn-secondary" id="tunester-btn" disabled>Run via tunester</button>
+      <button class="btn btn-secondary" id="clear-queue-btn" disabled>Clear Queue</button>
+      <button class="btn btn-secondary" id="clear-tuned-btn">Clear Tuned</button>
+    </div>
+    <div id="tunester-status" class="tunester-status" hidden></div>
+    <div id="cleaned-titles-section" class="cleaned-titles-box">
+      <div class="cleaned-titles-header">
+        <span>Cleaned Titles (for manual LLM testing)</span>
+        <button class="btn btn-secondary" id="copy-cleaned-btn" style="font-size:0.7rem;padding:3px 10px;">Copy</button>
+      </div>
+      <textarea id="cleaned-titles-text" readonly rows="6"></textarea>
+    </div>
+    <div id="track-list" class="results-list"></div>
+  </section>
+
+  <!-- Settings -->
+  <section id="settings-section">
+    <h2>Settings</h2>
+    <div class="settings-row">
+      <label for="user-agent-input">User Agent:</label>
+      <input type="text" id="user-agent-input" placeholder="Browser user agent string...">
+      <button type="button" id="user-agent-save-btn">Save</button>
+      <span id="user-agent-status"></span>
+    </div>
+    <div class="settings-row">
+      <label for="api-token-input">API Token:</label>
+      <input type="password" id="api-token-input" placeholder="GRABBY_API_TOKEN (required for delete/clear/edit actions)" autocomplete="off">
+      <button type="button" id="api-token-save-btn">Save</button>
+      <span id="api-token-status"></span>
+    </div>
+    <p style="font-size:0.8rem;color:#888;">Stored only in this browser (localStorage). Must match GRABBY_API_TOKEN in the server .env for delete/clear/title-edit to work.</p>
+    <div class="settings-row">
+      <label for="cookies-file">YouTube Cookies (.txt):</label>
+      <input type="file" id="cookies-file" accept=".txt">
+      <button type="button" id="cookies-upload-btn">Upload</button>
+      <button type="button" id="cookies-clear-btn" class="btn btn-danger">Clear</button>
+      <span id="cookies-status"></span>
+    </div>
+    <p style="font-size:0.8rem;color:#888;">Cookies bypass YouTube 403 blocks on datacenter IPs. Export from "Get cookies.txt" browser extension.</p>
+  </section>
+
+  <!-- Tester -->
+  <section id="tester-section">
+    <h2>yt-dlp Tester</h2>
+    <p style="font-size:0.8rem;color:#888;">Run a test command. Use <code>{COOKIESFILE}</code> to inject uploaded cookies.</p>
+    <textarea id="test-command" style="width:650px;height:75px" placeholder="yt-dlp --cookies {COOKIESFILE} -F https://www.youtube.com/watch?v=..."></textarea>
+    <button type="button" id="test-run-btn">Run</button>
+    <textarea id="test-output" readonly style="width:650px;height:75px" placeholder="Output will appear here..."></textarea>
+  </section>
+</div>
+
+<!-- Audio player -->
+<div id="player-bar">
+  <span id="player-title"></span>
+  <audio id="player" controls></audio>
+</div>
+
+<!-- Duplicates modal -->
+<div id="duplicates-modal" class="modal-overlay">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h3>Potential Duplicates</h3>
+      <button class="btn btn-secondary" id="close-duplicates-btn">&times;</button>
+    </div>
+    <div id="duplicates-list" class="results-list"></div>
+    <div class="modal-footer">
+      <button class="btn btn-danger" id="delete-selected-btn" disabled>Delete Selected</button>
+      <span id="duplicates-summary"></span>
+    </div>
+  </div>
+</div>
+
+<!-- Relative for the same reason as the stylesheet ref; ?v= unchanged. -->
+<script src="static/js/app.js?v=23"></script>
+</body>
+</html>

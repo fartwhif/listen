@@ -1,0 +1,837 @@
+<div class="max-w-4xl mx-auto p-3 sm:p-6 bg-zinc-950 text-white min-h-screen font-sans">
+  <!-- Now Playing Player - FIRST ELEMENT ON PAGE -->
+  @if (currentVideo(); as video) {
+    <div class="mb-8 bg-zinc-900 border border-zinc-700 rounded-3xl p-3">
+
+      <!-- TOP ROW: Thumbnail left + (immediately to its right) playback buttons + link icon -->
+      <div class="flex items-center gap-4">
+        
+        <!-- Thumbnail (exactly the size you liked) -->
+        @if (!lowBandwidthMode()) {
+          <img [src]="video.thumbnailPath || ''" 
+               loading="eager"
+               decoding="async"
+               width="192"
+               height="108"
+               class="w-32 h-32 object-cover rounded-2xl flex-shrink-0 shadow-inner"
+               (error)="onImageError($event)">
+        } @else {
+          <div class="w-32 h-32 bg-zinc-800 rounded-2xl flex items-center justify-center text-4xl flex-shrink-0">📻</div>
+        }
+
+        <!-- Everything to the right of thumbnail (rigid) -->
+        <div class="flex-1 min-w-0 flex items-center">
+          
+          <!-- Playback buttons (compact gap so link always fits on iPhone XR) -->
+          <div class="flex items-center gap-0 text-4xl">
+            <button (click)="skipPrevious()" 
+                    class="hover:scale-110 active:scale-95 transition text-zinc-400 hover:text-white">⏮️</button>
+            <button (click)="togglePlay()"
+                    class="text-5xl hover:scale-110 active:scale-95 transition">
+              {{ audio.paused ? '▶️' : '⏸️' }}
+            </button>
+            <button (click)="skipNext()" 
+                    class="hover:scale-110 active:scale-95 transition text-zinc-400 hover:text-white">⏭️</button>
+            <div class="ml-auto flex flex-col items-end gap-1">
+              <button (click)="toggleProtect(video.videoId, !video.protected)"
+                [class.text-amber-400]="video.protected"
+                [class.text-zinc-500]="!video.protected"
+                [class.hover:text-amber-300]="video.protected"
+                [class.hover:text-amber-200]="!video.protected"
+                title="{{ video.protected ? 'Protected - will not be auto-purged' : 'Not protected' }}"
+                class="text-3xl leading-none">{{ video.protected ? '🔒' : '🔓' }}</button>
+              <a [href]="getVideoLinkUrl(video)"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="text-sky-400 hover:text-sky-300 text-3xl leading-none flex items-center gap-1">
+                🔗
+              </a>
+              @if (video.isGrabby) {
+                <button (click)="$event.stopPropagation(); consumeGrabbyTrack(video.videoId)"
+                  title="Mark played & permanently delete from GrabbyTube (key: Delete)"
+                  class="text-rose-400 hover:text-rose-300 text-3xl leading-none">🗑️</button>
+              }
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- MIDDLE ROW: Progress bar (full width of card) -->
+      <div class="mt-2">
+        <input type="range" 
+               [value]="currentTime()" 
+               [max]="audio.duration || 100" 
+               (input)="onRangeInput($event.target.value)"
+               (change)="onRangeChange($event.target.value)"
+               class="w-full accent-green-500 cursor-pointer">
+        <div class="flex justify-between text-xs text-zinc-400 mt-0">
+          <span>{{ formatDuration(currentTime()) }}</span>
+          <span>{{ formatDuration(video.duration) }}</span>
+        </div>
+      </div>
+
+      <!-- Watchdog status. Silent starvation (a connection that stops
+           delivering bytes, or a media pipeline the OS discarded while this
+           tab was backgrounded) fires no error and moves nothing on screen —
+           this is the only visual sign it happened. -->
+      @if (stallPhaseLabel) {
+        <div class="mt-2 flex items-center justify-center gap-2 text-xs font-semibold text-amber-400"
+             role="status" aria-live="polite">
+          <span class="animate-pulse">⏳</span>{{ stallPhaseLabel }}
+        </div>
+      }
+
+      <!-- LAST ROW: Title + author (full width of card) -->
+      <div class="mt-2">
+        <div class="font-semibold text-xl leading-tight line-clamp-2">{{ video.title }}</div>
+        <div class="text-zinc-400 mt-1 line-clamp-1">{{ video.channel.title }} • {{ video.publishedAt | date:'mediumDate' }} | {{ getTimeAgo(video.publishedAt) }}</div>
+      </div>
+
+    </div>
+  }
+
+  <!-- Tabs -->
+  <div class="flex mb-8 bg-zinc-900 rounded-3xl p-1 border border-zinc-700 shadow-inner flex-wrap gap-1">
+    <button
+      (click)="setTab('queue')"
+      [class.bg-zinc-800]="activeTab() === 'queue'"
+      [class.text-white]="activeTab() === 'queue'"
+      class="flex-1 py-3 px-3 sm:px-4 text-sm font-semibold rounded-2xl transition-all flex items-center justify-center gap-1.5 whitespace-nowrap">
+      <span>📜</span>
+      <span class="hidden sm:inline">Queue</span>
+    </button>
+    <button
+      (click)="setTab('harvest')"
+      [class.bg-zinc-800]="activeTab() === 'harvest'"
+      [class.text-white]="activeTab() === 'harvest'"
+      class="flex-1 py-3 px-3 sm:px-4 text-sm font-semibold rounded-2xl transition-all flex items-center justify-center gap-1.5 whitespace-nowrap">
+      <span>🔄</span>
+      <span class="hidden sm:inline">Harvest</span>
+    </button>
+    <button
+      (click)="setTab('settings')"
+      [class.bg-zinc-800]="activeTab() === 'settings'"
+      [class.text-white]="activeTab() === 'settings'"
+      class="flex-1 py-3 px-3 sm:px-4 text-sm font-semibold rounded-2xl transition-all flex items-center justify-center gap-1.5 whitespace-nowrap">
+      <span>⚙️</span>
+      <span class="hidden sm:inline">Settings</span>
+    </button>
+    <button
+      (click)="setTab('import')"
+      [class.bg-zinc-800]="activeTab() === 'import'"
+      [class.text-white]="activeTab() === 'import'"
+      class="flex-1 py-3 px-3 sm:px-4 text-sm font-semibold rounded-2xl transition-all flex items-center justify-center gap-1.5 whitespace-nowrap">
+      <span>📥</span>
+      <span class="hidden sm:inline">Import</span>
+    </button>
+    <button
+      (click)="setTab('protected')"
+      [class.bg-zinc-800]="activeTab() === 'protected'"
+      [class.text-white]="activeTab() === 'protected'"
+      class="flex-1 py-3 px-3 sm:px-4 text-sm font-semibold rounded-2xl transition-all flex items-center justify-center gap-1.5 whitespace-nowrap">
+      <span>🔒</span>
+      <span class="hidden sm:inline">Protected</span>
+    </button>
+    <button
+      (click)="setTab('watched')"
+      [class.bg-zinc-800]="activeTab() === 'watched'"
+      [class.text-white]="activeTab() === 'watched'"
+      class="flex-1 py-3 px-3 sm:px-4 text-sm font-semibold rounded-2xl transition-all flex items-center justify-center gap-1.5 whitespace-nowrap">
+      <span>✅</span>
+      <span class="hidden sm:inline">Watched</span>
+    </button>
+  </div>
+
+  <!-- Queue Tab -->
+  @if (activeTab() === 'queue') {
+    <div class="grid gap-3">
+      @for (v of playlist(); track v.videoId) {
+        <div (click)="playVideo(v)" class="flex gap-3 bg-zinc-900 hover:bg-zinc-800 p-3 rounded-2xl cursor-pointer transition items-start">
+          @if (!lowBandwidthMode()) {
+            <img [src]="v.thumbnailPath || ''" 
+                 loading="lazy"
+                 decoding="async"
+                 fetchpriority="low"
+                 width="80"
+                 height="80"
+                 class="w-20 h-20 object-cover rounded-xl flex-shrink-0" 
+                 (error)="onImageError($event)">
+          } @else {
+            <div class="w-20 h-20 bg-zinc-800 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">📻</div>
+          }
+
+          <div class="flex-1 min-w-0">
+            <div class="font-medium line-clamp-2 leading-tight">{{ v.title }}</div>
+            <div class="text-zinc-400 line-clamp-1 text-sm">
+              {{ v.channel.title }}
+            </div>
+            <div class="text-zinc-400 line-clamp-1 text-sm">
+              {{ v.publishedAt | date:'mediumDate' }} • {{ getTimeAgo(v.publishedAt) }}
+            </div>
+          </div>
+
+          <div class="flex flex-col items-end gap-0 flex-shrink-0 w-[50px]">
+            <div class="text-right text-zinc-400 text-sm self-center w-[50px]">
+              {{ formatDuration(v.duration) }}
+            </div>
+            <button (click)="$event.stopImmediatePropagation(); toggleProtect(v.videoId, !v.protected)"
+               class="text-xl leading-none text-right"
+               [class.text-amber-400]="v.protected"
+               [class.text-zinc-500]="!v.protected"
+               [class.hover:text-amber-300]="v.protected"
+               [class.hover:text-amber-200]="!v.protected"
+               title="{{ v.protected ? 'Protected - will not be auto-purged (key: L)' : 'Not protected (key: L to lock current track)' }}">{{ v.protected ? '🔒' : '🔓' }}</button>
+             <a [href]="'https://www.youtube.com/watch?v=' + v.videoId"
+               target="_blank"
+               rel="noopener noreferrer"
+               (click)="$event.stopImmediatePropagation()"
+               class="text-sky-400 hover:text-sky-300 text-xl leading-none text-right">🔗</a>
+            @if (currentVideo()?.videoId === v.videoId) {
+              <span class="inline-block text-right text-green-400 text-3xl -mr-1 pt-0.5">▶️</span>
+            }
+          </div>
+        </div>
+      }
+
+      @if (playlist().length === 0) {
+        <div class="bg-zinc-900 p-12 rounded-3xl text-center text-zinc-400 text-lg">
+          No items in the queue yet.<br>
+          <span class="text-sm">Add some channels in Settings or Import to start harvesting!</span>
+        </div>
+      }
+
+      <div #loadMoreTrigger class="col-span-full py-12 flex justify-center items-center text-zinc-400">
+        @if (isLoadingMore()) {
+          <div class="flex items-center gap-3">
+            <span class="animate-spin text-2xl">⟳</span>
+            <span>Loading older items...</span>
+          </div>
+        } @else if (hasMore()) {
+          <div class="text-sm opacity-70">↓ Scroll for more items</div>
+        } @else if (playlist().length > 0) {
+          <div class="text-sm opacity-70">🎉 End of queue</div>
+        }
+      </div>
+    </div>
+  }
+
+  <!-- Protected Tab -->
+  @if (activeTab() === 'protected') {
+    <div class="grid gap-3">
+      @for (v of protectedPlaylist(); track v.videoId) {
+        <div (click)="playVideo(v)" class="flex gap-3 bg-zinc-900 hover:bg-zinc-800 p-3 rounded-2xl cursor-pointer transition items-start">
+          @if (!lowBandwidthMode()) {
+            <img [src]="v.thumbnailPath || ''"
+                  loading="lazy"
+                  decoding="async"
+                  fetchpriority="low"
+                  width="80"
+                  height="80"
+                  class="w-20 h-20 object-cover rounded-xl flex-shrink-0"
+                  (error)="onImageError($event)">
+          } @else {
+            <div class="w-20 h-20 bg-zinc-800 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">📻</div>
+          }
+
+          <div class="flex-1 min-w-0">
+            <div class="font-medium line-clamp-2 leading-tight">{{ v.title }}</div>
+            <div class="text-zinc-400 line-clamp-1 text-sm">
+              {{ v.channel.title }}
+            </div>
+            <div class="text-zinc-400 line-clamp-1 text-sm">
+              {{ v.publishedAt | date:'mediumDate' }} • {{ getTimeAgo(v.publishedAt) }}
+            </div>
+          </div>
+
+          <div class="flex flex-col items-end gap-0 flex-shrink-0 w-[50px]">
+            <div class="text-right text-zinc-400 text-sm self-center w-[50px]">
+              {{ formatDuration(v.duration) }}
+            </div>
+            <button (click)="$event.stopImmediatePropagation(); toggleProtect(v.videoId, !v.protected)"
+               class="text-xl leading-none text-right"
+               [class.text-amber-400]="v.protected"
+               [class.text-zinc-500]="!v.protected"
+               [class.hover:text-amber-300]="v.protected"
+               [class.hover:text-amber-200]="!v.protected"
+               title="{{ v.protected ? 'Protected - will not be auto-purged' : 'Not protected' }}">{{ v.protected ? '🔒' : '🔓' }}</button>
+            <a [href]="'https://www.youtube.com/watch?v=' + v.videoId"
+              target="_blank"
+              rel="noopener noreferrer"
+              (click)="$event.stopImmediatePropagation()"
+              class="text-sky-400 hover:text-sky-300 text-xl leading-none text-right">🔗</a>
+          </div>
+        </div>
+      }
+
+      @if (protectedPlaylist().length === 0) {
+        <div class="bg-zinc-900 p-12 rounded-3xl text-center text-zinc-400 text-lg">
+          No protected items yet.<br>
+          <span class="text-sm">Lock videos from the Queue tab to preserve them.</span>
+        </div>
+      }
+    </div>
+  }
+
+  <!-- Watched Tab -->
+  @if (activeTab() === 'watched') {
+    <div class="grid gap-3">
+      @for (v of watchedPlaylist(); track v.videoId) {
+        <div (click)="playVideo(v)" class="flex gap-3 bg-zinc-900 hover:bg-zinc-800 p-3 rounded-2xl cursor-pointer transition items-start">
+          @if (!lowBandwidthMode()) {
+            <img [src]="v.thumbnailPath || ''"
+                  loading="lazy"
+                  decoding="async"
+                  fetchpriority="low"
+                  width="80"
+                  height="80"
+                  class="w-20 h-20 object-cover rounded-xl flex-shrink-0"
+                  (error)="onImageError($event)">
+          } @else {
+            <div class="w-20 h-20 bg-zinc-800 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">📻</div>
+          }
+
+          <div class="flex-1 min-w-0">
+            <div class="font-medium line-clamp-2 leading-tight">{{ v.title }}</div>
+            <div class="text-zinc-400 line-clamp-1 text-sm">
+              {{ v.channel.title }}
+            </div>
+            <div class="text-zinc-400 line-clamp-1 text-sm">
+              {{ v.publishedAt | date:'mediumDate' }} • {{ getTimeAgo(v.publishedAt) }}
+            </div>
+          </div>
+
+          <div class="flex flex-col items-end gap-0 flex-shrink-0 w-[50px]">
+            <div class="text-right text-zinc-400 text-sm self-center w-[50px]">
+              {{ formatDuration(v.duration) }}
+            </div>
+            <button (click)="$event.stopImmediatePropagation(); toggleProtect(v.videoId, !v.protected)"
+               class="text-xl leading-none text-right"
+               [class.text-amber-400]="v.protected"
+               [class.text-zinc-500]="!v.protected"
+               [class.hover:text-amber-300]="v.protected"
+               [class.hover:text-amber-200]="!v.protected"
+               title="{{ v.protected ? 'Protected - will not be auto-purged' : 'Not protected' }}">{{ v.protected ? '🔒' : '🔓' }}</button>
+            <button (click)="$event.stopImmediatePropagation(); toggleWatched(v.videoId, false)"
+               class="text-xl leading-none text-right text-emerald-400 hover:text-emerald-300"
+               title="Unwatch (add back to queue)">↩️</button>
+            <a [href]="'https://www.youtube.com/watch?v=' + v.videoId"
+              target="_blank"
+              rel="noopener noreferrer"
+              (click)="$event.stopImmediatePropagation()"
+              class="text-sky-400 hover:text-sky-300 text-xl leading-none text-right">🔗</a>
+          </div>
+        </div>
+      }
+
+      @if (watchedPlaylist().length === 0) {
+        <div class="bg-zinc-900 p-12 rounded-3xl text-center text-zinc-400 text-lg">
+          No watched items yet.<br>
+          <span class="text-sm">Videos you've played will appear here.</span>
+        </div>
+      }
+    </div>
+  }
+
+  <!-- Harvest Tab -->
+  @if (activeTab() === 'harvest') {
+    <div class="bg-zinc-900 p-6 rounded-3xl">
+      <div class="flex items-center justify-between mb-6">
+        <h2 class="text-2xl font-bold flex items-center gap-3">
+          @if (harvestStatus().isRunning) {
+            <span class="text-emerald-400 animate-pulse">● LIVE</span>
+          }
+          Harvest Progress
+          @if (harvestStatus().session?.fresh) {
+            @if (harvestStatus().session!.state === 'up') {
+              <span class="text-xs font-medium bg-emerald-500/10 text-emerald-400 px-2.5 py-1 rounded-full">session live</span>
+            } @else {
+              <span class="text-xs font-medium bg-red-500/10 text-red-400 px-2.5 py-1 rounded-full animate-pulse">session dead — harvest paused</span>
+            }
+          } @else {
+            <span class="text-xs font-medium bg-zinc-700/40 text-zinc-400 px-2.5 py-1 rounded-full">session status unknown</span>
+          }
+        </h2>
+        <div class="text-sm text-zinc-400">
+          Updated {{ harvestStatus().lastUpdate | date:'shortTime' }}
+        </div>
+      </div>
+
+      <div class="mb-8">
+        <h3 class="text-lg font-medium mb-4 text-zinc-300">Currently Processing (Concurrent)</h3>
+        
+        @if (harvestStatus().activeItems.length === 0) {
+          <div class="bg-zinc-800 p-8 rounded-2xl text-center text-zinc-400">
+            No channels are currently being harvested.
+          </div>
+        }
+
+        @for (item of harvestStatus().activeItems; track item.channelId) {
+          <div class="bg-zinc-800 p-5 rounded-2xl mb-4 flex items-start gap-4">
+            <div class="flex-1 min-w-0">
+              <div class="font-medium line-clamp-1">{{ item.channelTitle }}</div>
+              @if (item.videoTitle) {
+                <div class="text-sm text-zinc-400 line-clamp-1 mt-1">{{ item.videoTitle }}</div>
+              }
+            </div>
+            <div class="text-right">
+              <div class="px-4 py-1 bg-emerald-900 text-emerald-400 text-sm font-medium rounded-xl">
+                {{ item.action }}
+              </div>
+              <div class="text-xs text-zinc-500 mt-2">
+                Started {{ item.startedAt | date:'shortTime' }} | {{ getTimeAgo(item.startedAt) }}
+              </div>
+            </div>
+          </div>
+        }
+      </div>
+
+      <div class="grid grid-cols-3 gap-4">
+        <div class="bg-zinc-800 p-5 rounded-2xl text-center">
+          <div class="text-5xl font-bold text-sky-400">{{ harvestStatus().processedVideos }}</div>
+          <div class="text-zinc-400 text-sm mt-1">Items Processed</div>
+        </div>
+        <div class="bg-zinc-800 p-5 rounded-2xl text-center">
+          <div class="text-5xl font-bold text-emerald-400">{{ harvestStatus().totalVideosThisRun }}</div>
+          <div class="text-zinc-400 text-sm mt-1">Total Items Found</div>
+        </div>
+        <div class="bg-zinc-800 p-5 rounded-2xl text-center">
+          <div class="text-5xl font-bold">{{ harvestStatus().channelsProcessed }} / {{ harvestStatus().totalChannels }}</div>
+          <div class="text-zinc-400 text-sm mt-1">Channels Completed</div>
+        </div>
+      </div>
+    </div>
+  }
+
+  <!-- Settings Tab -->
+  @if (activeTab() === 'settings') {
+    <div class="mb-8 bg-zinc-900 p-5 rounded-2xl border border-zinc-700">
+      <!-- 5-WAY AUTOPLAY SWITCH - at top of Settings -->
+      <div>
+        <div class="flex items-center justify-between text-sm mb-3">
+          <span class="font-medium text-zinc-300">Autoplay mode</span>
+        </div>
+        <div class="flex bg-zinc-800 rounded-3xl p-px shadow-inner text-xs flex-wrap gap-px">
+          <button 
+            (click)="setAutoplayMode('newest')"
+            [class.bg-emerald-600]="autoplayMode() === 'newest'"
+            [class.text-white]="autoplayMode() === 'newest'"
+            class="flex-1 px-4 py-3 font-medium rounded-3xl transition-all">
+            Newest
+          </button>
+          <button 
+            (click)="setAutoplayMode('newer')"
+            [class.bg-emerald-600]="autoplayMode() === 'newer'"
+            [class.text-white]="autoplayMode() === 'newer'"
+            class="flex-1 px-4 py-3 font-medium rounded-3xl transition-all">
+            Newer
+          </button>
+          <button 
+            (click)="setAutoplayMode('older')"
+            [class.bg-emerald-600]="autoplayMode() === 'older'"
+            [class.text-white]="autoplayMode() === 'older'"
+            class="flex-1 px-4 py-3 font-medium rounded-3xl transition-all">
+            Older
+          </button>
+          <button 
+            (click)="setAutoplayMode('oldest')"
+            [class.bg-emerald-600]="autoplayMode() === 'oldest'"
+            [class.text-white]="autoplayMode() === 'oldest'"
+            class="flex-1 px-4 py-3 font-medium rounded-3xl transition-all">
+            Oldest
+          </button>
+          <button 
+            (click)="setAutoplayMode('off')"
+            [class.bg-emerald-600]="autoplayMode() === 'off'"
+            [class.text-white]="autoplayMode() === 'off'"
+            class="flex-1 px-4 py-3 font-medium rounded-3xl transition-all">
+            Off
+          </button>
+        </div>
+      </div>
+
+      <div class="flex items-center mt-4 gap-3 bg-zinc-800 px-5 py-3 rounded-2xl">
+         <label class="flex items-center gap-2 cursor-pointer">
+           <input type="checkbox"
+                   [ngModel]="lowBandwidthMode()"
+                   (ngModelChange)="toggleLowBandwidth()">
+           <span class="font-medium">Low Bandwidth Mode</span>
+         </label>
+         <span class="text-xs text-amber-400">(hides thumbnails &middot; 56K modem friendly)</span>
+       </div>
+
+       <div class="flex items-center mt-3 gap-3 bg-zinc-800 px-5 py-3 rounded-2xl">
+         <label class="flex items-center gap-2 cursor-pointer">
+           <input type="checkbox"
+                  [ngModel]="skipMarksWatched()"
+                  (ngModelChange)="toggleSkipMarksWatched()">
+           <span class="font-medium">Skip marks as finished</span>
+         </label>
+         <span class="text-xs text-amber-400">(next track treats current as fully played)</span>
+       </div>
+
+      <div class="flex flex-col sm:flex-row items-start sm:items-center gap-3 bg-zinc-800 px-5 py-3 rounded-2xl mt-3">
+        <label class="flex items-center gap-2 cursor-pointer flex-shrink-0">
+          <input type="checkbox" 
+                 [ngModel]="limitEnabled()" 
+                 (ngModelChange)="limitEnabled.set($event); saveConfig()">
+          <span class="font-medium">Per-channel rate limit</span>
+        </label>
+        
+        <div class="flex items-center gap-2 flex-1 flex-wrap">
+          <span class="font-medium whitespace-nowrap">Allow</span>
+          <input type="number" 
+                 [(ngModel)]="limitVideos" 
+                 (ngModelChange)="saveConfig()" 
+                 class="bg-zinc-700 text-white px-3 py-1 rounded-xl w-16 text-center outline-none" 
+                 min="1" max="20">
+          <span class="font-medium whitespace-nowrap">content items per</span>
+          <input type="number" 
+                 [(ngModel)]="limitHours" 
+                 (ngModelChange)="saveConfig()" 
+                 class="bg-zinc-700 text-white px-3 py-1 rounded-xl w-20 text-center outline-none" 
+                 min="1" max="720">
+          <span class="font-medium">hours</span>
+        </div>
+      </div>
+      <div class="flex flex-col sm:flex-row items-start sm:items-center gap-3 bg-zinc-800 px-5 py-3 rounded-2xl mt-3">
+        <label class="flex items-center gap-2 cursor-pointer flex-shrink-0">
+          <input type="checkbox" 
+                 [ngModel]="durationFilterEnabled()" 
+                 (ngModelChange)="durationFilterEnabled.set($event); saveConfig()">
+          <span class="font-medium">Content duration filter</span>
+        </label>
+        
+        <div class="flex items-center gap-2 flex-1 flex-wrap">
+          <span class="font-medium whitespace-nowrap">Between</span>
+          <input type="number" 
+                 [(ngModel)]="minDurationMinutes" 
+                 (ngModelChange)="saveConfig()" 
+                 class="bg-zinc-700 text-white px-3 py-1 rounded-xl w-16 text-center outline-none" 
+                 min="0" max="1440">
+          <span class="font-medium whitespace-nowrap">and</span>
+          <input type="number" 
+                 [(ngModel)]="maxDurationMinutes" 
+                 (ngModelChange)="saveConfig()" 
+                 class="bg-zinc-700 text-white px-3 py-1 rounded-xl w-20 text-center outline-none" 
+                 min="0" max="1440">
+          <span class="font-medium whitespace-nowrap">minutes</span>
+          <span class="text-xs text-amber-400 ml-auto">(harvest only • default max 12h)</span>
+        </div>
+      </div>
+
+      <div class="mt-6 bg-zinc-800 p-5 rounded-2xl">
+        <h3 class="font-medium mb-4 flex items-center gap-2 text-zinc-300">
+          🔍 Additional content discovery method
+          <span class="text-xs bg-amber-900 text-amber-300 px-2 py-0.5 rounded-full">yt-dlp</span>
+        </h3>
+
+        <div class="flex items-center gap-3 bg-zinc-700/50 p-3 rounded-xl mb-4">
+          <label class="flex items-center gap-2 cursor-pointer flex-1">
+            <input type="checkbox" 
+                   [ngModel]="alternativeMetadataEnabled()" 
+                   (ngModelChange)="alternativeMetadataEnabled.set($event); saveConfig()">
+            <span class="font-medium">Enable additional method</span>
+          </label>
+          <span class="text-xs text-emerald-400 whitespace-nowrap">Default: ON</span>
+        </div>
+
+        <div class="ml-8">
+          <div class="text-sm font-medium text-zinc-400 mb-3">Tabs to scrape with additional method:</div>
+          <div class="flex flex-wrap gap-x-8 gap-y-3">
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" 
+                     [ngModel]="scrapeVideosTab()" 
+                     (ngModelChange)="scrapeVideosTab.set($event); saveConfig()">
+              <span class="text-sm">Videos</span>
+            </label>
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" 
+                     [ngModel]="scrapeStreamsTab()" 
+                     (ngModelChange)="scrapeStreamsTab.set($event); saveConfig()">
+              <span class="text-sm">Streams</span>
+            </label>
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" 
+                     [ngModel]="scrapeShortsTab()" 
+                     (ngModelChange)="scrapeShortsTab.set($event); saveConfig()">
+              <span class="text-sm">Shorts</span>
+            </label>
+          </div>
+          <p class="text-xs text-zinc-500 mt-3">Augments content discovery when enabled.</p>
+        </div>
+      </div>
+
+      <!-- GrabbyTube ShuffleBag -->
+      <div class="mt-6 bg-zinc-800 p-5 rounded-2xl">
+        <h3 class="font-medium mb-4 flex items-center gap-2 text-zinc-300">
+          🎵 GrabbyTube ShuffleBag
+          <span class="text-xs bg-purple-900 text-purple-300 px-2 py-0.5 rounded-full">Mix</span>
+        </h3>
+
+        <div class="flex items-center gap-3 bg-zinc-700/50 p-3 rounded-xl mb-4">
+          <label class="flex items-center gap-2 cursor-pointer flex-1">
+            <input type="checkbox"
+                   [ngModel]="grabbyMixEnabled()"
+                   (ngModelChange)="grabbyMixEnabled.set($event); saveConfig()">
+            <span class="font-medium">Enable GrabbyTube shufflebag</span>
+          </label>
+          <span class="text-xs text-emerald-400 whitespace-nowrap">Default: ON</span>
+        </div>
+
+        <div class="flex items-center gap-3 bg-zinc-700/50 p-3 rounded-xl mb-4">
+          <label class="text-sm text-zinc-300">Mix ratio (normal:grabby):</label>
+          <input type="number" min="1" max="20" step="1"
+                 [ngModel]="grabbyMixRatio()"
+                 (ngModelChange)="setGrabbyRatio($event)"
+                 class="w-16 bg-zinc-800 px-2 py-1 rounded-lg text-white text-center">
+          <span class="text-xs text-zinc-400">to 1</span>
+          <span class="text-xs text-zinc-500 ml-auto">Higher = less grabby music</span>
+        </div>
+
+        <div class="flex items-center gap-3 bg-zinc-700/50 p-3 rounded-xl mb-4">
+          <label class="text-sm text-zinc-300">Max items per cluster:</label>
+          <input type="number" min="0" step="1"
+                 [ngModel]="grabbyClusterMaxSize()"
+                 (ngModelChange)="setGrabbyClusterMaxSize($event)"
+                 class="w-16 bg-zinc-800 px-2 py-1 rounded-lg text-white text-center">
+          <span class="text-xs text-zinc-500 ml-auto">0 = unlimited</span>
+        </div>
+
+        <p class="text-xs text-zinc-500">Mixes GrabbyTube music into the playlist at a {{ grabbyMixRatio() }}:1 normal-to-grabby mix ratio during harvest. Items appear clustered with recent content.</p>
+      </div>
+
+      <!-- Original settings content -->
+      <div class="flex flex-wrap mt-4 gap-8 items-center">
+        <div>
+          <span class="font-medium">Bitrate:</span>
+          <select [(ngModel)]="preferredBitrate" (ngModelChange)="onBitrateChange()" class="bg-zinc-800 px-4 py-2 rounded-xl ml-3 text-white">
+            <option [value]="32">32 kbps</option>
+            <option [value]="48">48 kbps</option>
+            <option [value]="64">64 kbps</option>
+            <option [value]="96">96 kbps</option>
+            <option [value]="128" selected>128 kbps</option>
+            <option [value]="160">160 kbps</option>
+            <option [value]="192">192 kbps</option>
+          </select>
+        </div>
+        <div>
+          <label class="flex items-center gap-2">
+            <input type="checkbox" [(ngModel)]="preferredMono" (ngModelChange)="onMonoChange()">
+            <span class="font-medium">Mono audio</span>
+          </label>
+        </div>
+        <div>
+          <span class="font-medium">Harvest items from last</span>
+          <input type="number" [(ngModel)]="maxHarvestDays" (ngModelChange)="saveConfig()" class="bg-zinc-800 px-4 py-2 rounded-xl w-16 text-center mx-2" min="1" max="30">
+          <span class="font-medium">days</span>
+        </div>
+        <div>
+          <span class="font-medium">Auto-purge entries older than</span>
+          <input type="number" [(ngModel)]="autoPurgeDays" (ngModelChange)="saveConfig()" class="bg-zinc-800 px-4 py-2 rounded-xl w-16 text-center mx-2" min="1" max="90">
+          <span class="font-medium">days</span>
+        </div>
+        <div class="w-full">
+          <span class="font-medium">User-Agent:</span>
+          <input [(ngModel)]="userAgent" (ngModelChange)="saveConfig()" 
+                 class="bg-zinc-800 px-4 py-2 rounded-xl ml-3 text-white w-full max-w-md">
+        </div>
+      </div>
+    </div>
+
+    <!-- Cookie Management Section -->
+    <div class="mb-8 bg-zinc-900 p-5 rounded-2xl border border-zinc-700">
+      <h3 class="font-medium mb-3">YouTube Cookies (for age-restricted & private)</h3>
+      
+      <div class="flex items-center gap-4 flex-wrap">
+        <input type="file" accept=".txt" (change)="uploadCookies($event)" class="hidden" #cookieFile>
+        <button (click)="cookieFile.click()" 
+                class="bg-emerald-600 hover:bg-emerald-700 px-6 py-3 rounded-xl font-medium flex items-center gap-2">
+          📤 Upload cookies.txt
+        </button>
+
+        <button (click)="clearCookies()" 
+                class="bg-red-600 hover:bg-red-700 px-6 py-3 rounded-xl font-medium">
+          🗑️ Clear Cookies
+        </button>
+      </div>
+
+      <div class="mt-4 text-xs text-zinc-400 flex flex-wrap gap-x-6">
+        <a href="https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc" 
+           target="_blank" class="underline">Get cookies.txt (Chrome extension)</a>
+        <a href="https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp" 
+           target="_blank" class="underline">How to pass cookies to yt-dlp</a>
+        <a href="https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies" 
+           target="_blank" class="underline">Exporting YouTube cookies guide</a>
+      </div>
+
+      @if (hasCookies()) {
+        <div class="mt-4 text-emerald-400 text-sm">✅ cookies.txt is currently loaded</div>
+      } @else {
+        <div class="mt-4 text-amber-400 text-sm">No cookies loaded</div>
+      }
+    </div>
+
+    <div class="mb-8 flex justify-end">
+      <button (click)="purgeAll()" class="bg-red-600 hover:bg-red-700 px-6 py-3 rounded-xl font-medium flex items-center gap-2">
+        🗑️ Purge All Cached Content
+      </button>
+    </div>
+
+    <!-- Channels with priority reordering -->
+    <div class="mb-10 bg-zinc-900 p-5 rounded-2xl">
+      <h2 class="text-xl mb-4">Monitored YouTube Channels <span class="text-zinc-400 text-sm font-normal">(top = highest priority)</span></h2>
+      
+      <div class="flex flex-col sm:flex-row gap-3 mb-4">
+        <input #chanId 
+               placeholder="Channel ID (UC...)" 
+               class="flex-1 bg-zinc-800 px-4 py-3 rounded-xl outline-none min-w-0">
+        
+        <input #chanTitle 
+               placeholder="Channel Title (leave blank to autofetch)" 
+               class="flex-1 bg-zinc-800 px-4 py-3 rounded-xl outline-none min-w-0">
+        
+        <button (click)="addChannel(chanId.value, chanTitle.value)" 
+                class="bg-blue-600 hover:bg-blue-700 px-8 py-3 rounded-xl font-medium whitespace-nowrap flex-shrink-0">
+          Add
+        </button>
+      </div>
+
+      <ul class="space-y-2">
+        @for (c of channels(); track c.channelId) {
+          <li class="flex justify-between items-center bg-zinc-800 px-4 py-3 rounded-xl">
+            <div class="flex-1 min-w-0 flex items-center gap-3">
+              @if (editingChannelId() === c.channelId) {
+                <input [(ngModel)]="editTitle"
+                       class="flex-1 bg-zinc-700 text-white px-4 py-2 rounded-2xl outline-none border border-zinc-600 focus:border-sky-400"
+                       (keyup.enter)="saveRename()"
+                       (keyup.escape)="cancelEditing()">
+                <button (click)="saveRename()" class="text-emerald-400 hover:text-emerald-300 text-2xl">✓</button>
+                <button (click)="cancelEditing()" class="text-red-400 hover:text-red-300 text-2xl">✕</button>
+              } @else {
+                <a [href]="'https://www.youtube.com/channel/' + c.channelId"
+                   target="_blank"
+                   rel="noopener noreferrer"
+                   class="hover:text-sky-400 flex items-center gap-2 flex-1 min-w-0 truncate"
+                   [class.opacity-40]="!c.active">
+                  {{ c.title }}
+                  <span class="text-xs text-sky-400">↗</span>
+                </a>
+                <button (click)="toggleChannelActive(c.channelId, !c.active); $event.stopImmediatePropagation()"
+                        [class.text-emerald-400]="c.active"
+                        [class.text-zinc-500]="!c.active"
+                        [class.hover:text-emerald-300]="c.active"
+                        [class.hover:text-emerald-200]="!c.active"
+                        title="{{ c.active ? 'Harvesting active' : 'Harvesting paused' }}"
+                        class="px-2 text-xl">{{ c.active ? '🟢' : '⏸️' }}</button>
+                <button (click)="startEditing(c.channelId, c.title); $event.stopImmediatePropagation()"
+                        class="text-zinc-400 hover:text-white px-2 text-xl">✏️</button>
+                <button (click)="startEditingDuration(c.channelId, c.minDuration, c.maxDuration); $event.stopImmediatePropagation()"
+                        [class.text-amber-400]="c.minDuration != null || c.maxDuration != null"
+                        [class.text-zinc-500]="c.minDuration == null && c.maxDuration == null"
+                        title="{{ c.minDuration != null || c.maxDuration != null ? 'Duration override active — click to edit' : 'No duration override — click to set' }}"
+                        class="px-2 text-xl">⏱️</button>
+              }
+            </div>
+
+            @if (editingChannelId() !== c.channelId) {
+              <div class="flex items-center gap-px text-zinc-400 text-lg">
+                <button (click)="moveToTop(c.channelId); $event.stopImmediatePropagation()" class="hover:text-white px-3 py-1">↑↑</button>
+                <button (click)="moveUp(c.channelId); $event.stopImmediatePropagation()" class="hover:text-white px-3 py-1">↑</button>
+                <button (click)="moveDown(c.channelId); $event.stopImmediatePropagation()" class="hover:text-white px-3 py-1">↓</button>
+                <button (click)="moveToBottom(c.channelId); $event.stopImmediatePropagation()" class="hover:text-white px-3 py-1">↓↓</button>
+              </div>
+            }
+
+            <button (click)="deleteChannel(c.channelId); $event.stopImmediatePropagation()"
+                    class="text-red-400 hover:text-red-500 text-2xl leading-none ml-4">×</button>
+          </li>
+
+          <!-- Duration override editor -->
+          @if (editingDurationChannelId() === c.channelId) {
+            <li class="bg-zinc-800 px-4 py-3 rounded-xl ml-4 border border-amber-500/30">
+              <div class="text-xs text-amber-400 mb-2">Duration override (minutes, leave empty for global default)</div>
+              <div class="flex items-center gap-3 flex-wrap">
+                <label class="flex items-center gap-2">
+                  <span class="text-zinc-400 text-sm">Min:</span>
+                  <input type="number" min="0" max="10080"
+                         [ngModel]="editDurationMin()"
+                         (ngModelChange)="editDurationMin.set($event === '' ? null : $event)"
+                         placeholder="—"
+                         class="w-20 bg-zinc-700 text-white px-3 py-1 rounded-lg outline-none border border-zinc-600 focus:border-amber-400 text-sm">
+                </label>
+                <label class="flex items-center gap-2">
+                  <span class="text-zinc-400 text-sm">Max:</span>
+                  <input type="number" min="0" max="10080"
+                         [ngModel]="editDurationMax()"
+                         (ngModelChange)="editDurationMax.set($event === '' ? null : $event)"
+                         placeholder="—"
+                         class="w-20 bg-zinc-700 text-white px-3 py-1 rounded-lg outline-none border border-zinc-600 focus:border-amber-400 text-sm">
+                </label>
+                <button (click)="saveChannelDuration()" class="text-emerald-400 hover:text-emerald-300 text-sm font-medium">Save</button>
+                <button (click)="cancelEditingDuration()" class="text-zinc-400 hover:text-white text-sm">Cancel</button>
+              </div>
+            </li>
+          }
+        }
+        @if (channels().length === 0) {
+          <li class="bg-zinc-800 px-4 py-8 rounded-2xl text-center text-zinc-400">
+            No channels monitored yet. Add one above or use the Import tab.
+          </li>
+        }
+      </ul>
+    </div>
+  }
+
+  <!-- Import Tab -->
+  @if (activeTab() === 'import') {
+    <div class="bg-zinc-900 p-5 rounded-2xl">
+      <p class="text-zinc-400 mb-6">Paste YouTube channel IDs, channel URLs, or video URLs (one per line). Channels are added as active subscriptions. Videos are downloaded individually, protected from purge, and their channels are added as inactive.</p>
+      <textarea #importList rows="14" class="w-full bg-zinc-800 px-4 py-3 rounded-2xl outline-none font-mono text-sm resize-none" placeholder="UCxxxxxxxxxxxxxxxxxxxx&#10;https://www.youtube.com/watch?v=xxxxxxxxxxx&#10;https://www.youtube.com/@channelname&#10;https://youtu.be/xxxxxxxxxxx"></textarea>
+      <div class="flex items-center gap-4 mt-6">
+        <button (click)="importChannels(importList.value)" [disabled]="isImporting()" class="flex-1 bg-emerald-600 hover:bg-emerald-700 py-4 rounded-2xl font-semibold text-lg flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">🚀 <span *ngIf="!isImporting()">Import</span><span *ngIf="isImporting()">Importing... please wait</span></button>
+        <button (click)="importList.value = ''; importResults.set([])" class="px-8 py-4 bg-zinc-700 hover:bg-zinc-600 rounded-2xl font-medium">Clear</button>
+      </div>
+      @if (isImporting()) {
+          <div class="mt-8 bg-zinc-950 rounded-2xl p-4 text-center text-yellow-400">
+            ⏳ Importing... this may take a while for download &amp; transcoding
+          </div>
+        }
+        @if (importResults().length > 0) {
+        <div class="mt-8">
+          <h3 class="text-lg font-medium mb-3">Import Results</h3>
+          <div class="bg-zinc-950 rounded-2xl overflow-hidden">
+            @for (r of importResults(); track r.input) {
+              <div class="flex items-center justify-between px-5 py-4 border-b border-zinc-800 last:border-none">
+                <div class="flex items-center gap-3 min-w-0">
+                  <span class="text-lg flex-shrink-0">{{ r.type === 'video' ? '🎬' : '📺' }}</span>
+                  <div class="min-w-0">
+                    <div class="font-mono text-sm truncate">{{ r.input }}</div>
+                    @if (r.channelTitle) {
+                      <div class="text-xs text-zinc-500">{{ r.channelTitle }}</div>
+                    }
+                  </div>
+                </div>
+                <div class="flex items-center gap-3 flex-shrink-0 ml-4">
+                  @if (r.status === 'added') {
+                    <span class="text-emerald-400">✅ {{ r.type === 'video' ? 'Downloaded &amp; Protected' : 'Added' }}</span>
+                    @if (r.title) {
+                      <span class="text-zinc-400 text-sm truncate max-w-[200px]">{{ r.title }}</span>
+                    }
+                  }
+                  @if (r.status === 'skipped') {
+                    <span class="text-amber-400">⏭️ Skipped</span>
+                    <span class="text-zinc-500 text-xs">{{ r.reason || '(already exists)' }}</span>
+                  }
+                  @if (r.status === 'failed') {
+                    <span class="text-red-400">❌ Failed</span>
+                    <span class="text-zinc-400 text-sm">{{ r.reason }}</span>
+                  }
+                </div>
+              </div>
+            }
+          </div>
+        </div>
+      }
+    </div>
+  }
+</div>

@@ -1,0 +1,22 @@
+#!/bin/bash
+# The gated yt-dlp, as a single argv word.
+#
+# tunester's YTDLP and GrabbyTube's yt-dlp binary setting are used as argv[0]
+# (a list of strings, no shell), while DrivePod builds a shell command string.
+# Both shapes want ONE executable path, so this is it: the gate plus the real
+# yt-dlp, wrapped so no caller has to know the gate exists or restructure a
+# subprocess list.
+#
+# Contract: `ytdlgated [yt-dlp args...]` == `ytdlgate.sh yt-dlp [args...]`.
+# The real binary is resolved from PATH with this directory removed, so the
+# wrapper can never exec itself.
+set -u
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+path=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$here" | paste -sd: -)
+real=$(PATH="$path" command -v yt-dlp || true)
+if [ -z "$real" ]; then
+  echo "ytdlgated: no real yt-dlp on PATH (looked without $here)" >&2
+  exit 127
+fi
+exec "$here/ytdlgate.sh" "$real" "$@"

@@ -1,0 +1,48 @@
+# Everything the build installs or generates for itself, so `COPY stack/... `
+# never carries a host tree into the image:
+#   - npm ci regenerates node_modules (the prisma client is generated in-stage);
+#   - npx tsc / ng build regenerate dist;
+#   - pip installs into the image.
+# Runtime data (grabbytube.db, grabby-tracks.json, downloads, cookies) belongs
+# under /data, not under /srv/stack, so it is ignored here even though the
+# vendored trees still hold the files the old containers wrote in place.
+**/node_modules/
+**/dist/
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/*.tsbuildinfo
+**/.angular/
+**/npm-debug.log*
+
+# Secrets and host-only config: tracked files carry placeholders and read real
+# values from the environment, so a .env must never reach the image (a baked
+# secret survives every later rebuild of the .env bind-mount).
+**/.env
+**/.env.local
+**/*.local
+
+# Runtime state from the standalone deployments (the hub keeps its own copy of
+# each under /data; migrate.py moves these in).
+**/*.db
+**/*.db-wal
+**/*.db-shm
+stack/grabbytube/grabby-tracks.json
+stack/grabbytube/grabby-index.json
+**/*.bak
+stack/tunester/downloads/
+stack/tunester/.nzb-cache/
+stack/vault/data/
+stack/drivepod/data/
+stack/drivepod/cache/
+stack/frogrock/dnas/
+
+# VCS + editor noise: the vendored trees keep their own .gitignored shape, and
+# `git` metadata would only bloat the build context.
+**/.git/
+**/.gitignore
+**/.gitattributes
+.dockerignore
+data/
+*.tar
+*.tar.gz

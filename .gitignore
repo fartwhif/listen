@@ -1,1 +1,33 @@
+# Secrets: tracked files carry placeholders / env lookups only (see .env.example).
 .env
+.env.*.bak
+
+# Build products: every one of these is regenerated in the image build
+# (npm ci, npx tsc, ng build, pip install), so none of them belong in git.
+**/node_modules/
+**/dist/
+**/.angular/
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/*.tsbuildinfo
+
+# Runtime state: the hub keeps its own copy under the state directory
+# (HUB_DATA_DIR, outside this repo); these are leftovers from the standalone
+# containers writing in place.
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.bak
+**/*.log
+stack/grabbytube/grabby-tracks.json
+stack/grabbytube/grabby-index.json
+stack/tunester/downloads/
+stack/tunester/.nzb-cache/
+stack/vault/data/
+stack/drivepod/data/
+stack/drivepod/cache/
+stack/frogrock/dnas/
+data/
+*.tar
+*.tar.gz

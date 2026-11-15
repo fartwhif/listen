@@ -1,0 +1,7 @@
+{
+  "slugs": ["owner"],
+  "defaultSlug": "owner",
+  "partitions": {
+    "owner": { "mode": "single", "name": "Home", "owner": "owner", "radio": true, "vault": "owner" }
+  }
+}

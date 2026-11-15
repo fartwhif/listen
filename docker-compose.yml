@@ -1,13 +1,94 @@
+name: listen
+
 services:
   listen:
     build: .
     container_name: listen
+    image: listen-hub:latest
     restart: unless-stopped
+    # WireGuard in-container: NET_ADMIN to create/program wg0, and src_valid_mark
+    # because wg0's FwMark (see wireguard/wg0.conf.template) is what keeps
+    # container-originated tunnel traffic on the pinned route table.
     cap_add:
       - NET_ADMIN
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
     ports:
+      # The gateway: the ONLY gated listener, and the target of every
+      # *.example.com server_name that points at this box.
       - "${LISTEN_PORT:-8200}:80"
+      # Front broadcaster. Unauthenticated by contract (a broadcast stream is
+      # public), and reachable two ways on purpose:
+      #   frogrock.example.com:443 -> peer:8090   (the player + /stream.mp3)
+      #   DNAS YP/listener URL     -> peer:8090 (the registered stream source)
+      # Only index 0's broadcaster binds non-loopback; extra partitions bind
+      # loopback and are gateway-only (platform/gen-conf.py radio_env).
+      - "${RADIO_PORT:-8090}:8090"
+      # stream-fix shim (0.0.0.0 inside, per stack/streamfix/fixer.py). The DNAS
+      # relay pulls it over the mesh - http://<this peer IP>:8091/stream.mp3 -
+      # and this publish is the host-side `curl localhost:8091/stream.mp3` check.
+      - "${SHIM_PORT:-8091}:8091"
+      # Front GrabbyTube (its own UI + library API; grabbytube.example.com).
+      - "${GRABBY_PUBLIC_PORT:-8101}:8101"
+      # Shared tuner pool (tunester.example.com). gen-conf binds it 0.0.0.0.
+      - "${TUNESTER_PORT:-8102}:8102"
+    volumes:
+      # ALL state - hub.db, partitions.json, users/<slug>/… (library, cache,
+      # per-partition databases, cookies), vaults/<vault>/profiles/<slug>/…,
+      # pool/{out,cache,nzb-cache,jobs,blobs}, the pool blob store and the
+      # migration marker - plus the pre-hub trees, in ONE bind mount.
+      #
+      # One mount is not tidiness, it is the whole reason the first-start
+      # import costs no disk: os.link() is a same-MOUNT operation, not a
+      # same-filesystem one. Measured here (Docker 24, overlayfs) three ways:
+      # two bind mounts of the SAME ext4 (identical st_dev 10302) -> EXDEV;
+      # a named volume + a bind of the same device -> EXDEV; one bind whose
+      # tree holds both names -> nlink=2. So the obvious layout (state in a
+      # named volume, the old repos bind-mounted :ro beside it) can never
+      # hardlink, and platform/migrate.py silently takes its copy fallback:
+      # 41 GB of media duplicated for nothing.
+      #
+      # State therefore lives at $HUB_HOST_DIR/listen-data ON THE HOST, which
+      # is also the relocation story: moving the data to another drive is
+      # `mv` the directory, edit HUB_HOST_DIR, recreate - no volume plumbing
+      # and no compose edit. The cost of the single mount is that the old
+      # trees are visible read-write instead of :ro; nothing here ever writes
+      # outside the state directory (migrate.py never deletes a source).
+      - ${HUB_HOST_DIR:-..}:/mnt/stack
+    environment:
+      # The state directory INSIDE that mount. Every consumer resolves its
+      # paths from this one name - entrypoint.sh, gen-conf.py (which renders
+      # each tenant's absolute cache/library/vault paths into the supervisor
+      # programs), hubauth, hubdb, hub.py, migrate, poolimport, watchdog - so
+      # changing it relocates the whole stack. Compose `environment:` beats
+      # `env_file:`, so set HUB_HOST_DIR in .env, not HUB_DATA_DIR.
+      HUB_DATA_DIR: /mnt/stack/listen-data
+      # Pre-hub state to import, as paths INSIDE the same mount, which is what
+      # makes media import a hardlink instead of a copy: os.link() refuses
+      # ACROSS mounts, so a second bind mount of the same filesystem (the usual
+      # `../DrivePod:/srv/legacy/drivepod:ro` shape) silently costs a full copy.
+      # Interpolated so a .env or an exported shell value can point one root at
+      # an archived tree; an absent root is skipped, so a fresh box says "nothing
+      # to import". A root outside /mnt/stack still imports - through migrate.py's
+      # copy fallback, timestamps carried over.
+      HUB_LEGACY_DRIVEPOD_CACHE: ${HUB_LEGACY_DRIVEPOD_CACHE:-/mnt/stack/DrivePod/cache}
+      HUB_LEGACY_DRIVEPOD_DATA: ${HUB_LEGACY_DRIVEPOD_DATA:-/mnt/stack/DrivePod/data}
+      HUB_LEGACY_GRABBY: ${HUB_LEGACY_GRABBY:-/mnt/stack/GrabbyTube}
+      HUB_LEGACY_TUNESTER_DOWNLOADS: ${HUB_LEGACY_TUNESTER_DOWNLOADS:-/mnt/stack/tunester/downloads}
+      HUB_LEGACY_YTCOOKIES_DATA: ${HUB_LEGACY_YTCOOKIES_DATA:-/mnt/stack/ytcookies/data}
     env_file:
       - .env
+    networks:
+      # The project's own bridge (what this container runs on today), plus the
+      # `shared` bridge the six pre-hub containers are on. `shared` is only for
+      # the rollback window: during it the old containers can still resolve
+      # names on this bridge and vice versa. It costs nothing to keep, and it
+      # means a partition add never needs a compose change.
+      - default
+      - shared
+
+networks:
+  default:
+    driver: bridge
+  shared:
+    external: true
