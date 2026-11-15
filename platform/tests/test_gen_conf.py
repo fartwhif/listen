@@ -916,6 +916,43 @@ def test_picker_and_auth_pages_agree_with_the_registry(two):
     assert "%(options)s" not in login and "%(front)s" not in pair
 
 
+def test_auth_pages_carry_the_script_and_post_the_right_way(two):
+    """Every door page loads hub.js AND declares the no-JS fallback POST.
+
+    The pages carry `data-action=login`, and hub.js is what turns that into a
+    fetch. Without a `<script>` tag it is an ordinary HTML form, which submits
+    GET to its own URL: clicking Log in rewrote the address bar to
+    `/login?slug=owner&username=owner&password=<secret>` and redisplayed the
+    empty door (live report 2026-11-15 - the gateway access log recorded the
+    password in cleartext and a fresh 200 `/login` per "attempt"), so it looked
+    like nothing happened and the secret landed in history and in the log.
+
+    Both halves matter: the script is what makes the scripted path work, and
+    `method=post action=/api/auth/<verb>` means a browser that does not run
+    hub.js (scripting disabled, a car head-unit that blocks it, a stale page
+    whose script request failed) still sends credentials as a form body instead
+    of a query string.
+    """
+    for verb in ("login", "pair", "logout"):
+        body = next(b for p, b in gen.auth_pages(two)
+                    if p.endswith(f"{verb}.html"))
+        assert '<script src=/hub.js defer></script>' in body, verb
+        assert (f'<form data-action={verb} method=post '
+                f'action=/api/auth/{verb}>') in body, verb
+        for tag in re.findall(r"<form\b[^>]*>", body):
+            assert "method=post" in tag, (verb, tag)
+        assert body.index("</head>") < body.index("<body"), verb
+    # The picker has no form, so it needs no script; it must still offer doors.
+    picker = gen.picker_html(two)
+    assert "href=/login" in picker and "href=/pair" in picker
+
+    # The asset it points at is real and shipped, and the gateway serves it
+    # ungated (a 404 here is how the scripted path would silently die).
+    script = pathlib.Path(REPO) / "hub" / "hub.js"
+    assert script.exists() and "api/auth/login" in script.read_text()
+    conf = open(f"{REPO}/nginx/gateway.conf").read()
+    assert 'location = /hub.js' in conf
+
 def test_gateway_exposes_the_portal_and_deny_shape():
     """Static-file contract the generated blocks depend on: `@noauth` is the
     401 every generated media/api location names, and the gate plumbing has to
@@ -1782,6 +1819,43 @@ def test_served_auth_endpoints_read_both_body_encodings(served_ident):
     assert status == 403 and b"not a member" in body, (status, body)
     status, _, body = post(stub, "/login", "form", {
         "slug": "owner", "username": "owner", "password": "wrongpassword"})
+    assert status == 401 and b"wrong username or password" in body, (status, body)
+
+    # ---- a browser form post gets its redirect AS a redirect ------------
+    # The no-JS fallback sends Accept: text/html with a form body. 200 +
+    # {"redirect": ...} strands that caller on a JSON page it cannot follow,
+    # and hub.js is distinguishable because it names application/json in its
+    # Accept. So: text/html-only + form body -> 302 with Location AND the
+    # session cookie on the same response; anything else -> the JSON it had.
+    BROWSER = ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,*/*;q=0.8")
+    status, hdr, body = post(stub, "/login", "form", {
+        "slug": "family", "username": "kid", "password": "kidpassword",
+        "next": "/l/family/cache/index.json"}, {"Accept": BROWSER})
+    assert status == 302, (status, body[:160])
+    assert hdr.get("Location") == "/l/family/cache/index.json", hdr
+    status, _, body = _fetch(stub, "/me",
+                             headers={**session_of(hdr["Set-Cookie"])})
+    me = json.loads(body)
+    assert status == 200 and (me["slug"], me["username"]) == ("family", "kid"), body
+
+    # `Accept: */*` - curl, a podcatcher, a script with no Accept at all -
+    # keeps its JSON body; the 302 is for HTML callers only.
+    status, _, body = post(stub, "/login", "form", {
+        "slug": "family", "username": "kid", "password": "kidpassword"},
+        {"Accept": "*/*"})
+    assert status == 200 and json.loads(body)["redirect"] == "/l/family/", body
+    # hub.js itself (JSON in Accept) is unaffected in either direction.
+    status, _, body = post(stub, "/login", "json", {
+        "slug": "family", "username": "kid", "password": "kidpassword"},
+        {"Accept": "application/json"})
+    assert status == 200 and json.loads(body)["redirect"] == "/l/family/", body
+
+    # A browser post that FAILS stays JSON: the inline error is rendered by
+    # hub.js, and a 302 back to /login would drop the reason on the floor.
+    status, _, body = post(stub, "/login", "form", {
+        "slug": "family", "username": "kid", "password": "wrongpassword"},
+        {"Accept": BROWSER})
     assert status == 401 and b"wrong username or password" in body, (status, body)
 
     # ---- codes + pairing: both fields, both shapes --------------------

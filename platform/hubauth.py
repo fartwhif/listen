@@ -118,6 +118,31 @@ class Hub(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
+    def wants_html(self) -> bool:
+        """True for a browser form post - the no-JS fallback on the door pages.
+
+        hub.js names JSON in its Accept header and an api client sends `*/*`
+        (or nothing), so only a top-level form submission asks for text/html
+        WITHOUT naming json. Such a caller cannot render `{"redirect": ...}`,
+        so it gets the 302 hub.js would have followed. Failures stay JSON: an
+        inline error needs the script, and the scripted path is what humans
+        have.
+        """
+        accept = self.headers.get("Accept", "")
+        return "text/html" in accept and "application/json" not in accept
+
+    def send_result(self, body: dict, extra: dict) -> None:
+        """200 + JSON for hub.js and api callers, 302 for a browser form post."""
+        if self.wants_html():
+            self.send_response(302)
+            self.send_header("Location", body["redirect"])
+            self.send_header("Cache-Control", "no-store")
+            for k, v in extra.items():
+                self.send_header(k, v)
+            self.end_headers()
+            return
+        self.send_json(200, body, extra)
+
     def cookies(self) -> dict:
         out = {}
         for part in self.headers.get("Cookie", "").split(";"):
@@ -343,9 +368,9 @@ class Hub(BaseHTTPRequestHandler):
             return self.send_json(403, {"error": "not a member of that partition"})
         token = hubdb.mint_session(self.conn, slug, username,
                                    self.headers.get("User-Agent", "")[:80])
-        return self.send_json(200, {"slug": slug, "username": username,
-                                    "redirect": self.login_target(body, slug)},
-                              {"Set-Cookie": self.set_session_cookie(token)})
+        return self.send_result({"slug": slug, "username": username,
+                                 "redirect": self.login_target(body, slug)},
+                                {"Set-Cookie": self.set_session_cookie(token)})
 
     def handle_pair(self, body: dict) -> None:
         """No password on a shared/car device: type the code the owner shows."""
@@ -363,17 +388,17 @@ class Hub(BaseHTTPRequestHandler):
             self.strike()
             return self.send_json(401, {"error": "code not recognised or already used"})
         user = hubdb.lookup_session(self.conn, token)
-        return self.send_json(200, {"slug": slug, "username": user["username"],
-                                    "redirect": self.login_target(body, slug)},
-                              {"Set-Cookie": self.set_session_cookie(token)})
+        return self.send_result({"slug": slug, "username": user["username"],
+                                 "redirect": self.login_target(body, slug)},
+                                {"Set-Cookie": self.set_session_cookie(token)})
 
     def handle_logout(self) -> None:
         token = self.cookies().get(COOKIE) or (self.bearer() or "")
         if token and not token.startswith("lk_"):
             hubdb.drop_session(self.conn, token)
-        return self.send_json(200, {"ok": True, "redirect": "/"},
-                              {"Set-Cookie": f"{COOKIE}=; Path=/; Max-Age=0; "
-                                             "HttpOnly; SameSite=Lax"})
+        return self.send_result({"ok": True, "redirect": "/"},
+                                {"Set-Cookie": f"{COOKIE}=; Path=/; Max-Age=0; "
+                                               "HttpOnly; SameSite=Lax"})
 
     def handle_codes(self, body: dict) -> None:
         slug = (body.get("slug") or "").strip()

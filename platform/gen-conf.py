@@ -974,11 +974,12 @@ _LOGIN = """<!doctype html>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Log in - listen</title>
 <link rel=stylesheet href=/hub.css>
+<script src=/hub.js defer></script>
 </head>
 <body class="narrow">
 <h1><a href=/>listen</a></h1>
 <h2>Log in</h2>
-<form data-action=login>
+<form data-action=login method=post action=/api/auth/login>
   <label>Partition
     <select name=slug>%(options)s</select>
   </label>
@@ -1000,11 +1001,12 @@ _PAIR = """<!doctype html>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Pair a device - listen</title>
 <link rel=stylesheet href=/hub.css>
+<script src=/hub.js defer></script>
 </head>
 <body class="narrow">
 <h1><a href=/>listen</a></h1>
 <h2>Pair a device</h2>
-<form data-action=pair>
+<form data-action=pair method=post action=/api/auth/pair>
   <label>Partition
     <select name=slug>%(options)s</select>
   </label>
@@ -1031,11 +1033,12 @@ _LOGOUT = """<!doctype html>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Logged out - listen</title>
 <link rel=stylesheet href=/hub.css>
+<script src=/hub.js defer></script>
 </head>
 <body class="narrow">
 <h1><a href=/>listen</a></h1>
 <h2>Signing out</h2>
-<form data-action=logout>
+<form data-action=logout method=post action=/api/auth/logout>
   <p><button type=submit>Sign out of this device</button></p>
 </form>
 <p class=hint>Only this device's session is dropped. Other devices paired to the

@@ -125,6 +125,15 @@ for anonymous broadcast listeners (checked in hubauth against `X-Gate-Uri`, so
 `?pass=` cannot unlock an API route). Unauthenticated hits redirect to `/login`;
 API paths get `401` + JSON instead.
 
+The `/login` and `/pair` doors are plain `method=post` forms carrying a
+`data-action` attribute, and `hub/hub.js` (served ungated at `/hub.js`) is what
+turns that into a `fetch` to `/api/auth/*` and paints the result. Both halves
+are load-bearing: with scripting on the answer is JSON (`{"redirect": …}`
+followed by the script, errors shown inline); with scripting off the same
+keystrokes post the form and hubauth answers a browser `Accept: text/html` with
+the 302 into the partition. Either way the password rides in the request body,
+never in the URL.
+
 ## Operator CLI
 
 `hub` is the only writer of the registry and the identity DB from the shell. It
