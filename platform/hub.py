@@ -4,8 +4,8 @@
 `hub` is the only writer of the registry's partition list and of the identity
 DB from the shell; the gateway/identity server are the read side. It runs where
 the data lives (inside the container: `docker compose exec listen hub ...`), so
-paths are the container's, and it never touches nginx or supervisor config -
-it edits partitions.json and lets the watchdog regenerate everything.
+paths are the container's. Everything but `reload` only edits partitions.json
+and lets the watchdog regenerate and apply the config; `reload` does that apply.
 """
 import argparse
 import getpass
@@ -15,7 +15,13 @@ import re
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# __file__ is the REAL file when hub is imported, but through the image's
+# `/usr/local/bin/hub` symlink it is the LINK - and the CLI is normally invoked
+# that way. Every sibling lookup must resolve the link first: dirname(__file__)
+# of the symlink is /usr/local/bin, where gen-conf.py does not live, and `hub
+# reload` used to die with "can't open file /usr/local/bin/gen-conf.py".
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
 import envfmt
 import hubdb
 
@@ -25,8 +31,6 @@ import hubdb
 # overrides, which is what the tests and entrypoint use.
 REGISTRY = os.environ.get("HUB_REGISTRY") or \
     os.environ.get("HUB_DATA_DIR", "/data").rstrip("/") + "/partitions.json"
-DEFAULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "partitions.default.json")
 SLUG_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
@@ -421,14 +425,32 @@ def _vault_note(vault: str, host: str, members: list) -> None:
 
 
 def cmd_reload(a) -> int:
-    """Re-run the generator and apply it. The watchdog does this automatically
-    within ~10 s of a registry edit; this is the impatient version."""
-    r = subprocess.run([sys.executable,
-                        os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                     "gen-conf.py")])
+    """Re-run the generator and apply it - the impatient version of what the
+    watchdog does within ~10 s of a registry edit, so the same three steps.
+
+    `nginx -s reload` IS one of them. Regenerate + `supervisorctl reread/update`
+    alone gives a new partition its backends while the gateway still serves the
+    OLD location set: live programs, no proxy, 404 at the mount. And validating
+    before reloading is not decoration - it is what keeps a bad partitions.json
+    edit from replacing a working gateway config with one that 404s every
+    partition (nginx keeps running the config it already has). A failed `nginx
+    -t` still gets the supervisor half applied, exactly as the watchdog does it:
+    programs are validated by supervisor itself, and the old gateway keeps
+    serving the partitions that were already live.
+    """
+    r = subprocess.run([sys.executable, os.path.join(HERE, "gen-conf.py")])
     if r.returncode:
         return r.returncode
-    return ctl("reread") or ctl("update")
+    test = subprocess.run(["nginx", "-t"], capture_output=True, text=True,
+                          check=False)
+    bad = test.returncode
+    if bad:
+        print("hub reload: the generated config FAILED nginx -t, so nginx keeps "
+              f"the previous config:\n{test.stderr.strip()}", file=sys.stderr)
+    else:
+        subprocess.run(["nginx", "-s", "reload"], check=False)
+    sup = ctl("reread") or ctl("update")
+    return 1 if bad else sup
 
 
 def cmd_status(a) -> int:
@@ -496,7 +518,8 @@ def main() -> int:
     p.add_argument("--lines", default="80")
     p.set_defaults(fn=cmd_vault)
 
-    p = sub.add_parser("reload", help="force supervisor to re-read generated config")
+    p = sub.add_parser("reload", help="regenerate config and apply it to nginx "
+                       "and supervisor")
     p.set_defaults(fn=cmd_reload)
 
     p = sub.add_parser("status", help="programs + recent sessions")

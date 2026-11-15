@@ -20,7 +20,10 @@ def main(slug: str | None = None) -> int:
     pytest run would seed a partition named after the test file."""
     if slug is None:
         slug = sys.argv[1] if len(sys.argv) > 1 else "owner"
-    dest = os.environ.get("HUB_REGISTRY", "/data/partitions.json")
+    # Same derivation as gen-conf/hub/hubauth: the state directory is what
+    # relocates, HUB_REGISTRY only overrides it.
+    dest = os.environ.get("HUB_REGISTRY") or \
+        os.environ.get("HUB_DATA_DIR", "/data").rstrip("/") + "/partitions.json"
     if os.path.exists(dest):
         return 0
     with open(DEFAULTS) as fh:

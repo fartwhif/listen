@@ -138,6 +138,48 @@ def test_load_registry_missing_file_seeds_nothing(tmp_path, monkeypatch):
     assert gen.load_registry()["slugs"] == []
 
 
+def test_registry_default_follows_the_state_directory(clean_env, reload_modules):
+    """The registry default is DERIVED from HUB_DATA_DIR, not a literal /data.
+
+    compose relocates the state directory with HUB_DATA_DIR and only the
+    entrypoint exports HUB_REGISTRY, so any other process running the generator
+    with the container's environment - a `docker exec`, an operator's hand-run -
+    had no way to be told where the registry is. The literal default made it
+    read a file that does not exist, report "0 partition(s)" and atomically
+    rewrite every generated target to match: the live gateway then 404'd every
+    partition while partitions.json sat right there untouched.
+    """
+    os.environ["HUB_DATA_DIR"] = "/mnt/stack/listen-data"
+    gen2 = reload_modules("gen-conf")
+    assert gen2.REGISTRY == "/mnt/stack/listen-data/partitions.json"
+    # An explicit HUB_REGISTRY still wins: that is the handle the watchdog
+    # program is supervised with, and the handle these tests use.
+    os.environ["HUB_REGISTRY"] = "/etc/stack/partitions.json"
+    gen3 = reload_modules("gen-conf")
+    assert gen3.REGISTRY == "/etc/stack/partitions.json"
+
+
+def test_seeder_writes_where_the_generator_will_read(clean_env, monkeypatch,
+                                                      tmp_path):
+    """seed-registry's destination has to be the same derivation, or a box that
+    relocates its state directory seeds a registry under /data that gen-conf -
+    reading the relocated path - never sees, and comes up with zero partitions.
+    Never overwriting is the other half: a re-run must not clobber edits."""
+    seed = importlib.import_module("seed-registry")
+    dest = tmp_path / "listen-data/partitions.json"
+    monkeypatch.setenv("HUB_DATA_DIR", str(tmp_path / "listen-data"))
+    assert seed.main("owner") == 0
+    assert dest.exists()
+    dest.write_text('{"slugs": ["keep"]}')
+    assert seed.main("owner") == 0
+    assert json.loads(dest.read_text())["slugs"] == ["keep"]
+    # HUB_REGISTRY overrides, and is what the entrypoint exports in practice.
+    explicit = tmp_path / "explicit.json"
+    monkeypatch.setenv("HUB_REGISTRY", str(explicit))
+    assert seed.main("owner") == 0
+    assert explicit.exists()
+
+
 def test_port_map_is_collision_free(two):
     seen = {}
     for i in range(gen.MAX_PARTITIONS):

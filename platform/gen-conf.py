@@ -41,7 +41,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # letting supervisord reject the whole generated file later.
 from envfmt import REASON, env_str, env_val, unsuitable
 
-REGISTRY = os.environ.get("HUB_REGISTRY", "/data/partitions.json")
+# Derived, exactly like platform/hub.py's: HUB_DATA_DIR is what relocates the
+# state directory (compose sets it from HUB_HOST_DIR), so a process that has the
+# container's environment but not HUB_REGISTRY - a `docker exec`, an operator's
+# hand-run of this file - reads the registry the running stack reads. Pointing
+# this default at a file that does not exist used to make such a run report
+# "0 partition(s)" and rewrite every generated target for it.
+REGISTRY = os.environ.get("HUB_REGISTRY") or \
+    os.environ.get("HUB_DATA_DIR", "/data").rstrip("/") + "/partitions.json"
 STACK = os.environ.get("STACK_DIR", "/srv/stack")
 DATA = os.environ.get("HUB_DATA_DIR", "/data")
 # The public domain every door URL and the picker are built from (see vnc_door).

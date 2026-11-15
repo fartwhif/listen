@@ -8,11 +8,59 @@ only — while both printed "settings updated"/added, so `hub partition set s
 --set K=v` looked applied and changed nothing. These tests pin: either spelling
 works on either action, an empty `set` is an error rather than a silent no-op,
 and a refused setting leaves the registry byte-identical.
+
+Also here: `hub reload`, the one verb that APPLIES config. Two things have to
+stay true about it - it finds `gen-conf.py` when `hub` itself was reached through
+the image's `/usr/local/bin/hub` symlink, and it reloads nginx after validating
+the config it just generated (see the reload tests).
 """
+import importlib.machinery
+import importlib.util
 import json
+import os
+import subprocess
 import sys
 
 import pytest
+
+PLATFORM = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+GEN_CONF = os.path.join(PLATFORM, "gen-conf.py")
+
+
+class FakeRun:
+    """`subprocess.run` stand-in: records every argv, returncodes by program.
+
+    `reload` talks to three programs (gen-conf, nginx, supervisorctl) and its
+    contract is about their ORDER and which ones run at all, which is exactly
+    what a real subprocess cannot show on a host with no nginx and no
+    supervisor to talk to.
+    """
+
+    def __init__(self, **codes):
+        self.calls = []
+        self.codes = codes
+
+    def run(self, argv, **kw):
+        self.calls.append(list(argv))
+        code = self.codes.get(self._prog(argv), 0)
+        return subprocess.CompletedProcess(argv, code, "" if code else "ok",
+                                           "nginx: configuration file "
+                                           "test failed" if code else "")
+
+    @staticmethod
+    def _prog(argv):
+        """Name a call by the program it drives, not by argv[0] - gen-conf runs
+        as `[sys.executable, …/gen-conf.py]`, so argv[0] is just python."""
+        if any(str(a).endswith("gen-conf.py") for a in argv):
+            return "gen-conf"
+        return argv[0]
+
+
+def fake_nginx(hub, monkeypatch):
+    """Point hub's subprocess at a recorder, with nginx's `-t` succeeding."""
+    fake = FakeRun(**{"gen-conf.py": 0, "nginx": 0, "supervisorctl": 0})
+    monkeypatch.setattr(hub, "subprocess", fake)
+    return fake
 
 
 @pytest.fixture
@@ -217,3 +265,100 @@ def test_repointing_a_vault_reports_both_ends(hub_env, monkeypatch, capsys):
     assert "alpha now signs in as vault beta" in out
     assert "vault alpha moves to kid" in out
     assert spec_of(registry, "alpha")["vault"] == "beta"
+
+
+# ---------------------------------------------------------------------- reload
+def load_hub_via(path, name: str):
+    """Import hub.py as if it LIVED at `path` (a symlink in the tests).
+
+    The explicit loader is not ceremony: `spec_from_file_location` alone returns
+    None for `/usr/local/bin/hub`, which has no `.py` to choose a loader from,
+    and that extensionless name is exactly what the image puts on PATH. The
+    loader has to reach the spec's `origin`, or `has_location` stays false and
+    the module gets no `__file__` - the very value under test.
+    """
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_file_location(name, path, loader=loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def test_reload_finds_gen_conf_when_hub_runs_through_its_symlink(tmp_path,
+                                                                 monkeypatch,
+                                                                 clean_env):
+    """The image puts hub on PATH as the symlink `/usr/local/bin/hub`, and that
+    is how every `docker compose exec listen hub …` reaches it.
+
+    `__file__` is then the LINK, not the file: the imports still work, because
+    Python resolves the script path for `sys.path[0]`, but `dirname(abspath(
+    __file__))` is /usr/local/bin - and `reload` ran gen-conf from there, so the
+    one verb that applies config died with `can't open file
+    /usr/local/bin/gen-conf.py: No such file or directory` while everything else
+    about the CLI worked. Sibling lookups have to go through the resolved path.
+    """
+    link = tmp_path / "bin/hub"
+    link.parent.mkdir()
+    link.symlink_to(os.path.join(PLATFORM, "hub.py"))
+    hub = load_hub_via(str(link), "hub_via_symlink")
+    # The trap itself, stated as an assertion: this module believes it lives in
+    # a directory that has no gen-conf.py in it.
+    assert os.path.dirname(os.path.abspath(hub.__file__)) == str(link.parent)
+    assert not os.path.exists(os.path.join(str(link.parent), "gen-conf.py"))
+    fake = FakeRun()
+    monkeypatch.setattr(hub, "subprocess", fake)
+    monkeypatch.setattr(sys, "argv", ["hub", "reload"])
+    assert hub.main() == 0
+    target = fake.calls[0][1]
+    assert target == GEN_CONF
+    assert os.path.isfile(target), f"reload tried to run {target}"
+
+
+def test_reload_validates_the_gateway_before_reloading_it(hub_env, monkeypatch):
+    """`nginx -s reload` IS part of reload, and only after `nginx -t` passes.
+
+    Regenerate + supervisor alone gives a new partition its backends while the
+    gateway still serves the OLD location set - live programs, no proxy, 404 at
+    the mount - and the watchdog does the same three steps 10 s later, so the
+    impatient version must not be a different, partial procedure.
+    """
+    hub, _ = hub_env
+    fake = fake_nginx(hub, monkeypatch)
+    assert run(hub, monkeypatch, ["reload"]) == 0
+    progs = [FakeRun._prog(c) for c in fake.calls]
+    assert progs == ["gen-conf", "nginx", "nginx", "supervisorctl",
+                     "supervisorctl"]
+    assert fake.calls[1][1:] == ["-t"]
+    assert fake.calls[2][1:] == ["-s", "reload"]
+    assert [c[-1] for c in fake.calls[3:]] == ["reread", "update"]
+
+
+def test_bad_generated_config_never_reaches_the_gateway(hub_env, monkeypatch,
+                                                        capsys):
+    """A partitions.json edit gen-conf can render but nginx rejects must not
+    replace a working gateway - the failure mode the entrypoint guards against,
+    which `hub reload` used to bypass by never validating at all.
+
+    The supervisor half is still applied (gen-conf wrote valid program files and
+    supervisor judges those itself), and the command reports failure.
+    """
+    hub, _ = hub_env
+    fake = FakeRun(**{"nginx": 1})
+    monkeypatch.setattr(hub, "subprocess", fake)
+    assert run(hub, monkeypatch, ["reload"]) == 1
+    assert ["-s", "reload"] not in [c[1:] for c in fake.calls]
+    assert [c[-1] for c in fake.calls if FakeRun._prog(c) == "supervisorctl"] \
+        == ["reread", "update"]
+    err = capsys.readouterr().err
+    assert "FAILED nginx -t" in err and "keeps the previous config" in err
+
+
+def test_generator_failure_applies_nothing(hub_env, monkeypatch):
+    """If gen-conf refused to write, there is no new config to validate or
+    apply: neither nginx nor supervisor is touched, and its exit code is the
+    answer."""
+    hub, _ = hub_env
+    fake = FakeRun(**{"gen-conf": 3})
+    monkeypatch.setattr(hub, "subprocess", fake)
+    assert run(hub, monkeypatch, ["reload"]) == 3
+    assert [FakeRun._prog(c) for c in fake.calls] == ["gen-conf"]

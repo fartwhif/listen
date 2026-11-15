@@ -140,7 +140,7 @@ docker compose exec listen hub code family                  # one-time pairing c
 docker compose exec listen hub vault restart family         # force a sign-in now
 docker compose exec listen hub vault logs family --lines 200
 docker compose exec listen hub partition default owner
-docker compose exec listen hub reload                       # force re-read
+docker compose exec listen hub reload    # regenerate + apply (nginx, supervisor)
 ```
 
 `hub vault <verb> <slug>` addresses the **account** that slug signs in as, so on
@@ -149,6 +149,13 @@ it touched plus every partition that shares it. `restart family` when `family`
 signs in as `owner` restarts `vault-owner`. `hub partition list` labels each line
 `(browser)` or `(via <host>)` for the same reason, and `partition rm`/`set
 --vault` say where a vault's browser moved when its host goes away.
+
+`hub reload` is the only verb that applies anything: it re-runs the generator,
+validates the result with `nginx -t`, reloads nginx only if that passed, and
+then does supervisor's `reread`/`update`. Everything else edits
+`partitions.json` and leaves the apply to the watchdog (~10 s). Skipping the
+nginx half is what made a new partition come up with live backends and a 404 at
+its mount: the gateway keeps serving the location set it was last reloaded with.
 
 Devices pair at `/pair`: mint a code, type it on the device, it gets a session
 cookie bound to that partition. Users are global, sessions are per partition; a
@@ -195,13 +202,19 @@ source).
 
 - **A program is a `[program:]` in `/etc/supervisor/conf.d/stack-programs.conf`,
   generated.** Hand-edits to generated files are overwritten within 10 s; edit
-  `partitions.json` (or the generator) instead.
+  `partitions.json` (or the generator), then `hub reload` to apply it.
 - **Logs**: `docker compose logs` shows supervisord and whatever wrote to PID 1;
   each program's own log is a file — `docker compose exec listen tail -100
   /var/log/sup/grabbytube-owner.err.log`, or `hub vault logs <slug>`.
 - **`docker exec` with a stray env**: a shell inside the container does not
   inherit a tenant's `environment=` block, so run app code through the
   supervised process or via its HTTP API, not `docker exec … python app.py`.
+  The platform side (gen-conf, `hub`, hubauth, watchdog, seed-registry) resolves
+  the state directory from container-level `HUB_DATA_DIR` for exactly that
+  reason: gen-conf used to hardcode `/data/partitions.json`, so a hand-run
+  generator with the container's env read a registry that does not exist and
+  rewrote every generated file to "no partitions" — the live gateway 404'd every
+  partition while `partitions.json` sat untouched.
 - **Chromium is started on demand** (`autostart=false`), and **once per vault,
   not per partition**: a healthy box runs zero chromium, and two tenants sharing
   a Google account share one browser family (`vault-<vault>`, the host partition,
@@ -242,6 +255,13 @@ source).
 ## Tests
 
 ```bash
-docker run --rm -v $PWD:/src -w /src --entrypoint sh listen-hub:latest \
+docker run --rm -v $PWD:/src -w /src -e LISTEN_TEST_NGINX=1 \
+  --entrypoint sh listen-hub:latest \
   -c "python3 -m pytest platform/tests -q"
 ```
+
+`LISTEN_TEST_NGINX=1` is what enables the gateway checks: they need a real
+`nginx -t` plus the stack snippets at `/etc/nginx/snippets`, i.e. the image.
+Without it those tests skip and the rest still runs, so a bare run on the host
+(`python3 -m pytest platform/tests -q`, needs pytest) covers everything except
+the generated nginx config.
