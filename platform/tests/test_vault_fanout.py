@@ -30,8 +30,19 @@ pytest.importorskip("websocket")
 
 import sys
 
-VAULT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__)))), "stack", "vault")
+BASE = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+# Two homes, one layout difference: the repo keeps the vendored exporter under
+# `stack/vault`, while the image flattens `stack/*` to the top of /srv/stack
+# (Dockerfile `COPY stack/vault ./vault`). Both are searched so the suite says
+# the same thing on a host checkout and inside the image.
+for _cand in (os.path.join(BASE, "stack", "vault"),
+              os.path.join(BASE, "vault")):
+    if os.path.isdir(_cand):
+        VAULT_DIR = _cand
+        break
+else:
+    VAULT_DIR = os.path.join(BASE, "stack", "vault")   # the skip message names it
 if VAULT_DIR not in sys.path:
     sys.path.insert(0, VAULT_DIR)
 
