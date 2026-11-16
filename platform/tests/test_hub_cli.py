@@ -249,6 +249,66 @@ def test_removing_the_last_partition_says_the_vault_is_unhosted(hub_env,
     assert "no partition left names vault alpha" in capsys.readouterr().out
 
 
+def count(conn, sql: str) -> int:
+    return len(conn.execute(sql).fetchall())
+
+
+def test_removing_a_partition_prunes_its_identity_rows(hub_env, monkeypatch,
+                                                       capsys):
+    """Sessions are looked up by (slug, username), so a session row that outlives
+    its partition keeps a dead browser cookie VALID forever - and if the operator
+    re-uses that slug for somebody else, the old tenant's cookie walks straight
+    into the new partition. `partition rm` has to take the tenant's identity rows
+    with it and say what it dropped."""
+    hub, registry = hub_env
+    run(hub, monkeypatch, ["partition", "add", "alpha", "--owner", "owner"])
+    run(hub, monkeypatch, ["partition", "add", "beta", "--owner", "owner"])
+    conn = hub.hubdb.init()
+    hub.hubdb.add_user(conn, "guest", "hunter2hunter2")
+    hub.hubdb.set_membership(conn, "alpha", "guest")
+    hub.hubdb.set_membership(conn, "beta", "guest")
+    dead = hub.hubdb.mint_session(conn, "alpha", "guest", "car")
+    other = hub.hubdb.mint_session(conn, "beta", "guest", "phone")
+    hub.hubdb.mint_code(conn, "alpha")
+    conn.close()
+    assert hub.hubdb.lookup_session(hub.hubdb.init(), dead)  # control: it was live
+
+    assert run(hub, monkeypatch, ["partition", "rm", "alpha"]) == 0
+    out = capsys.readouterr().out
+    # alpha held owner's admin membership + guest's, guest's session and one
+    # minted code: all four rows go, and the message counts each table.
+    assert ("removed (4 identity row(s) pruned: 2 memberships, 1 sessions, "
+            "1 pair_codes)") in out
+
+    conn = hub.hubdb.init()
+    assert count(conn, "SELECT 1 FROM sessions WHERE slug='alpha'") == 0
+    assert count(conn, "SELECT 1 FROM memberships WHERE slug='alpha'") == 0
+    assert count(conn, "SELECT 1 FROM pair_codes WHERE slug='alpha'") == 0
+    # the other partition keeps its session and its membership of the same user,
+    # and the USER survives: they may belong to partitions still standing.
+    assert count(conn, "SELECT 1 FROM sessions WHERE slug='beta'") == 1
+    assert count(conn, "SELECT 1 FROM memberships WHERE slug='beta'") == 2
+    assert count(conn, "SELECT 1 FROM users WHERE username='guest'") == 1
+    conn.close()
+    assert not hub.hubdb.lookup_session(hub.hubdb.init(), dead)
+    assert hub.hubdb.lookup_session(hub.hubdb.init(), other)
+    assert "alpha" not in json.loads(registry.read_text())["partitions"]
+
+
+def test_removing_a_partition_with_no_identity_rows_claims_no_pruning(hub_env,
+                                                                      monkeypatch,
+                                                                      capsys):
+    """The common case: a partition nobody was ever added to, paired into, or
+    given a code must not claim it pruned rows it never touched."""
+    hub, _ = hub_env
+    run(hub, monkeypatch, ["partition", "add", "alpha", "--owner", ""])
+    capsys.readouterr()
+    assert run(hub, monkeypatch, ["partition", "rm", "alpha"]) == 0
+    out = capsys.readouterr().out
+    assert "identity row(s) pruned" not in out
+    assert "partition alpha removed. Its data under" in out
+
+
 def test_repointing_a_vault_reports_both_ends(hub_env, monkeypatch, capsys):
     """`--vault` moves a partition between Google accounts. The message has to
     cover both sides: where the moved partition's sign-in now comes from, and

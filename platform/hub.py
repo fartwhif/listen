@@ -282,10 +282,24 @@ def cmd_partition(a) -> int:
         if reg.get("defaultSlug") == a.slug:
             reg["defaultSlug"] = slugs[0] if slugs else None
         save_registry(reg)
+        # The identity DB is keyed on the slug, so its rows have to leave with
+        # the partition: a session row is looked up by (slug, username), so an
+        # orphan keeps a dead browser cookie VALID, and re-using this slug for
+        # some other tenant would hand that cookie straight to the new one.
+        # Same for pair_codes (a code outlives its minting partition otherwise).
+        conn = hubdb.init()
+        pruned = {t: conn.execute(f"DELETE FROM {t} WHERE slug=?",
+                                  (a.slug,)).rowcount
+                  for t in ("memberships", "sessions", "pair_codes")}
+        conn.commit()
+        conn.close()
+        live = sum(pruned.values())
+        detail = ", ".join(f"{v} {k}" for k, v in pruned.items() if v)
         data = os.environ.get("HUB_DATA_DIR", "/data")
-        print(f"hub: partition {a.slug} removed. Its data under "
-              f"{data}/users/{a.slug} and vaults/{a.slug} is left in place; "
-              f"delete it by hand if you mean it.")
+        print(f"hub: partition {a.slug} removed"
+              + (f" ({live} identity row(s) pruned: {detail})" if live else "")
+              + f". Its data under {data}/users/{a.slug} and vaults/{a.slug} "
+                "is left in place; delete it by hand if you mean it.")
         if was_host:
             if inherits:
                 print(f"     vault {vault} moves to {inherits}, which still names "
