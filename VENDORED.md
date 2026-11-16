@@ -16,7 +16,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 
 | Tree | Upstream | SHA | Patched files |
 |---|---|---|---|
-| `stack/drivepod/` | `fartwhif/DrivePod` | `1deb2bbaa13d56b57ff0382c2242175e25c4467c` (2026-11-15) | 2 |
+| `stack/drivepod/` | `fartwhif/DrivePod` | `1db5b425ab4b14208360b4edc51730dccdd9373e` (2026-11-16) | 2 |
 | `stack/grabbytube/` | `fartwhif/GrabbyTube` | `6d636e06736304a452ca901451849e2618fb1b9f` (2026-11-15) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `92bcc1f41c559f3498c30a51cd36013d9b5902e0` | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
@@ -40,7 +40,7 @@ moves the real state to `/data`, where the hub keeps it.
 
 ---
 
-## `stack/drivepod/` — DrivePod @ 1deb2bb
+## `stack/drivepod/` — DrivePod @ 1db5b42
 
 `backend/src/server.ts` (11 hunks)
 
@@ -63,7 +63,7 @@ Carried along byte-identical from upstream (no listen patch):
 `tests/content-audit.mjs` (A14/A14b became hard failures — it keys orphan and
 grabby-label checks on the `createdAt` marker), `AGENTS.md`, `ARCHITECTURE.md`.
 
-**Upstream 1deb2bb is the authorship-marker fix, and it changes what the hub's
+**Upstream 1db5b42 is the authorship-marker fix, and it changes what the hub's
 `/data` looks like on first start.** Ownership of a `cache/<id>/` folder is now
 GrabbyTube's sidecar `createdAt` (`isGrabbyAuthored` /
 `sidecarIsGrabbyAuthored`), never "a sidecar has a `videoId`" (DrivePod's own
@@ -93,7 +93,7 @@ the `/api/stream/…` sites (play, HEAD probes, retries) are built from it.
 `index.json`/`progress.json` are fetched as `${MOUNT}/cache/…`. No build-time
 prefix: the gateway writes the per-partition shell (`platform/gen-conf.py`).
 
-1deb2bb moved the "is this the same track?" decision into
+1db5b42 moved the "is this the same track?" decision into
 `stall-guard.streamTrackId(audio.src)` (`/\/api\/stream\/([A-Za-z0-9_-]+)/`) —
 the one place a mount prefix could have broken track identity, and it does not:
 the src this file assigns is `${MOUNT}/api/stream/<id>`, and the regex reads the
