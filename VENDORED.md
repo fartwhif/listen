@@ -158,8 +158,16 @@ instead of the old `entrypoint.sh`.
 ## `stack/streamfix/` and `vendor/bgutil/` — unmodified
 
 `fixer.py` + `Dockerfile` are byte-identical to `FrogRock/dnas/stream-fix` (the
-header-normalizing shim DNAS relays through). Only the `Dockerfile` is inert
-here — `gen-conf.py` supervises `python3 stack/streamfix/fixer.py` directly.
+header-normalizing shim DNAS relays through). Measured on the wire: through the
+shim the broadcaster answers `HTTP/1.1 200` with **no** `Transfer-Encoding:
+chunked` — the HTTP/1.0 downgrade this vintage ICY client needs, since a direct
+`:8090` request gets chunked framing that DNAS 2.6.1 cannot parse — and the
+relay logs `stream detected MPEG v2 layer 3 mono` and keeps issuing `Title
+update` lines across track transitions. Only the `Dockerfile` is inert here —
+`gen-conf.py` supervises `python3 stack/streamfix/fixer.py` directly, so the
+shim runs in the hub and DNAS reaches it as `http://<peer>:8091/stream.mp3`
+over WireGuard.
+
 `vendor/bgutil/server/` is the upstream `2.0.2` server subtree as-is; the pip
 plugin `bgutil-ytdlp-pot-provider==2.0.2` is the matching version, and the
 Dockerfile follows upstream's own build recipe (`npm ci` + `tsc` →
