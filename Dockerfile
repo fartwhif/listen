@@ -161,7 +161,7 @@ RUN mkdir -p /var/www/hub /etc/stack /etc/supervisor/conf.d \
     && cp nginx/platform.conf /etc/nginx/conf.d/10-platform.conf \
     && cp nginx/gateway.conf /etc/nginx/conf.d/20-gateway.conf \
     && cp -r nginx/snippets/. /etc/nginx/snippets/ \
-    && cp hub/hub.css hub/hub.js hub/robots.txt /var/www/hub/ \
+    && cp hub/hub.css hub/hub.js hub/dock.css hub/dock.js hub/robots.txt /var/www/hub/ \
     && rm -f /etc/nginx/sites-enabled/default \
     && chmod +x platform/entrypoint.sh platform/hub.py platform/vault-run.py \
                platform/ytdlgate.sh platform/ytdlgated \

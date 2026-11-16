@@ -582,9 +582,55 @@ GATE_LOGIN = ('    auth_request /_gate/{slug};\n'
               '    error_page 401 403 = /_login-redir;\n')
 SLUG_HDR = '    proxy_set_header X-Partition-Slug "{slug}";\n'
 SVC = "    include /etc/nginx/snippets/proxy-svc.conf;\n"
+GATE_USER_SET = '    auth_request_set $gate_user $upstream_http_x_user;\n'
 
 
-def _locations(slug: str, prefix: str, p: dict, spec: dict,
+def dock_filter(payload: dict, proxied: bool = True) -> str:
+    """The directives that put a dock into a page this gateway did not write.
+
+    Measured against this image's nginx (1.22) and against 1.26, each directive
+    exists because a shorter version was proved to fail:
+      `proxy_set_header Accept-Encoding ""` (proxy locations only) - sub_filter
+        refuses a compressed body, and every app here gzips its own HTML for a
+        client that asks (FrogRock's player is 30 KB, GrabbyTube's index 12 KB).
+        Without it the filter silently does nothing and the page ships bare.
+      `sub_filter_once on` - a page's head closes once; rewriting more than once
+        is how a page whose BODY contains `</head>` (a track title in GrabbyTube's
+        index, an error text) would grow a second dock.
+      a DOUBLE-QUOTED replacement string - a single-quoted one ends at the
+        payload's first `"`, and the text after it (`dio"}],` from `Ra"dio`) then
+        parses as a directive nginx does not know: `unexpected "n"`. Inside
+        double quotes nginx resolves `\\` and `\"` and interpolates `$`, which is
+        exactly what the payload needs (see dock_json(conf=True)).
+
+    `proxied=False` is the noVNC door, which answers from disk: there is no
+    upstream to negotiate Accept-Encoding with, and that block already carries
+    `gzip off` (committed earlier, for its own ws-path rewrite), which is what
+    keeps the body uncompressed for the filter here too.
+
+    NO `gzip off` on the proxy page blocks, deliberately: they are the page
+    blocks of mounts whose OTHER responses must stay compressed. FrogRock's
+    `/radio/api/status.json` is 76 KB un-compressed and the player polls it, and
+    noVNC's `core/rfb.js` is 105 KB; a mount-wide `gzip off` to satisfy the
+    filter would ship both raw (measured on a 2.6 KB status body: 2642 B on the
+    wire with `gzip off`, 227 B with gzip left on). The page bodies gain ~250 B
+    and stay a few KB, so compressing them on the way out costs nothing - the
+    filter only needs the body UNCOMPRESSED ON THE WAY IN, and Accept-Encoding
+    "" guarantees that without touching what the client receives.
+
+    The SEARCH token is the CLOSING `</head>`, not `<head>`: an app is free to
+    give its opening tag attributes (`<head data-x="y">`, which FrogRock's player
+    already does for its theme script) and an `<head>` search would then miss it
+    entirely, while all three upstream pages serve a plain `</head>`. Both forms
+    are brace-free and double-quoted, which is also what keeps nginx's tokenizer
+    from reading a bare `{` as the block opener.
+    """
+    ae = '    proxy_set_header Accept-Encoding "";\n' if proxied else ""
+    return (ae + "    sub_filter_once on;\n"
+            f'    sub_filter "</head>" "</head>{dock_block(payload, True)}";\n')
+
+
+def _locations(slug: str, prefix: str, p: dict, spec: dict, reg: dict,
                shell: bool = True, ws_port: int | None = None) -> str:
     """Locations for one partition.
 
@@ -601,10 +647,20 @@ def _locations(slug: str, prefix: str, p: dict, spec: dict,
     chromium runs for a member, so its noVNC door has to reach the HOST's
     browser. Omitted means "this slug is its own vault host" (vault_hosts hands
     both callers the value that is not).
+
+    `reg` is only ever read to build the dock payload of the two app pages this
+    partition owns (see dock_payload) - nothing about routing comes from it.
     """
     gate = GATE_JSON.format(slug=slug)
     glogin = GATE_LOGIN.format(slug=slug)
     hdr = SLUG_HDR.format(slug=slug)
+    # The dock for this partition's own pages, once per alias set: the payload
+    # of a page served at `prefix` names its surfaces by that prefix (see
+    # dock_payload), so the bare front aliases get their own copy rather than a
+    # mounted page's links.
+    dock_pay = dock_payload(prefix, slug, spec, reg)
+    dock_page = dock_filter(dock_pay)                    # proxied app pages
+    dock_door = dock_filter(dock_pay, proxied=False)     # the noVNC door
     home = f"{DATA}/users/{slug}"
     out = [f"\n# ==== partition {slug}: {prefix or 'bare aliases'} ====\n"]
     if prefix:
@@ -690,6 +746,16 @@ def _locations(slug: str, prefix: str, p: dict, spec: dict,
     # URI in a regex location forwards the WHOLE matched path. A bare
     # {prefix}/radio would match neither rule and 404, so it redirects.
     out.append(f"location = {prefix}/radio {{\n    return 301 {prefix}/radio/;\n}}\n")
+    # The player PAGE gets its own exact location, above the prefix that carries
+    # its API, its statics and its stream: the dock's sub_filter belongs on the
+    # HTML document only. On the mount everything else under /radio/ answers with
+    # JSON or bytes, and one filter over the whole mount would rewrite those too
+    # (status.json bodies routinely carry a track title, which is text the app
+    # escaped for JSON but not for HTML). An exact location beats the prefix for
+    # this URI only; every other path under /radio/ still gets the mount below.
+    out.append(f"location = {prefix}/radio/ {{\n{glogin}{GATE_USER_SET}{hdr}{dock_page}"
+               "    include /etc/nginx/snippets/proxy-svc.conf;\n"
+               f"    proxy_pass http://127.0.0.1:{p['radio']}/;\n}}\n")
     out.append(f'location ~ "^{prefix}/radio/stream(?:\\.mp3)?" {{\n'
                f"    auth_request /_gate/{slug};\n"
                "    error_page 401 403 = @noauth;\n"
@@ -737,10 +803,11 @@ def _locations(slug: str, prefix: str, p: dict, spec: dict,
     own_path = f"readQueryVariable('path', '{mount}vnc/websockify')"
     out.append(f"location = {prefix}/vnc {{\n{glogin}"
                f"    return 302 {prefix}/vnc/vnc_lite.html$is_args$args;\n}}\n")
-    out.append(f"location = {prefix}/vnc/ {{\n{glogin}"
+    out.append(f"location = {prefix}/vnc/ {{\n{glogin}{GATE_USER_SET}"
                f"    alias {NOVNC_DIR}/;\n"
-               "    gzip off;\n    sub_filter_once on;\n"
-               f"    sub_filter \"{stock_path}\" \"{own_path}\";\n"
+               "    gzip off;\n"
+               f'    sub_filter "{stock_path}" "{own_path}";\n'
+               f"{dock_door}"
                "    try_files /vnc_lite.html =404;\n}\n")
     out.append(f"location ^~ {prefix}/vnc/ {{\n{glogin}"
                f"    alias {NOVNC_DIR}/;\n"
@@ -762,6 +829,14 @@ def _locations(slug: str, prefix: str, p: dict, spec: dict,
     # over loopback with bare paths - which is why grabby itself needs no
     # mount handling.
     out.append(f"location = {prefix}/grabby {{\n    return 301 {prefix}/grabby/;\n}}\n")
+    # Its index page, in an exact location of its own, for the same reason the
+    # player has one: the dock filter must not run over the API responses under
+    # this mount. A tracklist cell is app-supplied text, and `</head>` in a JSON
+    # body would gain a stylesheet link and two scripts.
+    out.append(f"location = {prefix}/grabby/ {{\n{glogin}{GATE_USER_SET}{hdr}"
+               f"{dock_page}"
+               "    include /etc/nginx/snippets/proxy-svc.conf;\n"
+               f"    proxy_pass http://127.0.0.1:{p['grabby']}/;\n}}\n")
     out.append(f"location ^~ {prefix}/grabby/ {{\n{glogin}{hdr}"
                "    include /etc/nginx/snippets/proxy-svc.conf;\n"
                f"    proxy_pass http://127.0.0.1:{p['grabby']}/;\n}}\n")
@@ -815,12 +890,18 @@ def _locations(slug: str, prefix: str, p: dict, spec: dict,
     return "".join(out)
 
 
-def _front_bare(front: str, p: dict, ws_port: int | None = None) -> str:
+def _front_bare(front: str, p: dict, reg: dict, spec: dict,
+                ws_port: int | None = None) -> str:
     """Front-partition aliases with no prefix, so the callers that predate the
     gateway keep working byte-identically. No shell here: the portal root is
     the picker (the decision on the legacy hostnames), and the front
-    partition's own SPA lives at /l/<front>/ like every other one."""
-    return _locations(front, "", p, {}, shell=False, ws_port=ws_port)
+    partition's own SPA lives at /l/<front>/ like every other one.
+
+    `spec` is passed on because the two proxied APP pages the front owns (the
+    player, GrabbyTube's index) carry the dock at the bare paths too, and their
+    payload is built from the partition's own name and radio flag.
+    """
+    return _locations(front, "", p, spec, reg, shell=False, ws_port=ws_port)
 
 
 def nginx_locations(reg: dict) -> str:
@@ -833,12 +914,13 @@ def nginx_locations(reg: dict) -> str:
         host = hosts[spec["vault_slug"]]
         ws = ports(reg["partitions"][host]["index"])["ws"]
         out.append(_locations(slug, f"/l/{slug}", ports(spec["index"]), spec,
-                              ws_port=ws))
+                              reg, ws_port=ws))
     if reg["front"]:
         front = reg["partitions"][reg["front"]]
         host = hosts[front["vault_slug"]]
         ws = ports(reg["partitions"][host]["index"])["ws"]
-        out.append(_front_bare(reg["front"], ports(front["index"]), ws))
+        out.append(_front_bare(reg["front"], ports(front["index"]), reg, front,
+                               ws))
     return "".join(out)
 
 
@@ -875,22 +957,122 @@ def absolutize_refs(html: str) -> str:
     return _REL_REF.sub(lambda m: f'{m["attr"]}="/{m["val"]}"', html)
 
 
-HUB_SCRIPT = ('<script>window.__HUB__={{"slug":"{slug}",'
-              '"user":"__HUB_USER__"}}</script>')
+# The dock: one collapsed navigation tab on every browsable page of the stack
+# (hub/dock.css + hub/dock.js, served ungated at the portal root like hub.css).
+# Its content is a JSON payload published as `window.__HUB__`, which gen-conf
+# either WRITES into a page it owns (the picker, the SPA shells) or hands to
+# nginx as a `sub_filter` replacement (the radio player, GrabbyTube's index and
+# the noVNC door - pages whose bodies come from an app upstream).
+#
+# The payload's `user` is never known at generation time: it is whoever the gate
+# for THAT page answers. The file-written form therefore carries the placeholder
+# `__HUB_USER__` and the injected form carries `$gate_user`, which the page's own
+# `auth_request_set` fills - the same identity the api locations forward as
+# X-User. Nothing else about the payload differs between the two forms.
+USER_PLACEHOLDER = "__HUB_USER__"
+USER_VAR = "$gate_user"
+
+
+def dock_json(payload: dict, conf: bool = False) -> str:
+    """One payload as a JS object literal, escaped for whichever home it goes to.
+
+    `json.dumps` covers `"`, `\\` and control characters; these three extra
+    escapes exist because a <script> body and an nginx config string are each a
+    place a raw character ends something early, and both forms share them so a
+    partition name cannot behave differently in one home than the other:
+      `<` - the only way `</script>` can appear inside a JS string literal, and
+            a partition name is operator-supplied text (`hub partition add …`).
+      `'` - nginx does no escape processing inside single quotes, so a `'` in a
+            name would close a single-quoted replacement string.
+      `$` - nginx interpolates `$` even inside single quotes (measured against
+            this image's nginx: `'a\\$b'` dies at config parse with "unknown
+            variable b"), so a name carrying `$` would be read as a variable.
+    All three are legal JS string escapes, so the browser turns each character
+    back into itself: the picker's dock shows `Q's $afe`, not `\u0027s \u0024afe`.
+
+    `conf=True` then does two more things, both specific to a config string:
+      the placeholder becomes `"$gate_user"` (QUOTES INCLUDED: the gate's name
+        interpolates raw, and `"user":carol` is not JSON - measured, the
+        unquoted form yields a payload the page's own JSON parser rejects), and
+      every `\\` doubles and every `"` backslash-escapes, because nginx resolves
+        exactly those two sequences inside double quotes before sub_filter ever
+        sees the string. Round-tripped through a real 1.22 server: config
+        `Ra\\"dio` → served page `Ra\"dio` → browser sees `Ra"dio`.
+    """
+    text = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+    for raw, escaped in (("<", "\\u003c"), ("'", "\\u0027"), ("$", "\\u0024")):
+        text = text.replace(raw, escaped)
+    if conf:
+        text = text.replace(f'"{USER_PLACEHOLDER}"', f'"{USER_VAR}"')
+        text = text.replace("\\", "\\\\").replace('"', '\\"')
+    return text
+
+
+def dock_block(payload: dict, conf: bool = False) -> str:
+    """The three tags a page needs in order to grow its dock.
+
+    `defer` is what makes injection at `</head>` enough: a deferred script runs
+    after the document is parsed, so dock.js has a <body> to hang the tab from,
+    while the inline payload still runs before any app bootstrap. The tags carry
+    no `type=` (neither a module nor a classic-with-type script) so they behave
+    identically inside a proxied upstream document and inside a page gen-conf
+    wrote itself.
+    """
+    return ('<link rel=stylesheet href=/dock.css>'
+            f'<script>window.__HUB__={dock_json(payload, conf)}</script>'
+            '<script src=/dock.js defer></script>')
+
+
+def dock_payload(prefix: str, slug: str, spec: dict, reg: dict) -> dict:
+    """Payload for a page of ONE partition: its own surfaces first, then the
+    other partitions, because crossing a mount is the one jump a page's own
+    chrome cannot offer - every app's nav is intra-partition by construction.
+
+    Hrefs are mount-absolute (`/radio/` under the front's bare aliases,
+    `/l/family/radio/` under its mount) so they work without any app knowing the
+    dock exists. Every partition is ALSO listed in its `/l/<slug>/` form, which
+    exists for the front too, so no link depends on which alias set is mounted.
+    """
+    here = [{"href": f"{prefix}/", "label": "Listen"}]
+    if spec.get("radio", True):
+        here.append({"href": f"{prefix}/radio/", "label": "Radio"})
+    here.append({"href": f"{prefix}/grabby/", "label": "GrabbyTube"})
+    here.append({"href": f"{prefix}/vnc/", "label": "Cookie vault"})
+    elsewhere = [{"href": f"/l/{other}/",
+                  "label": f'{reg["partitions"][other]["name"]} (/{other})'}
+                 for other in reg["slugs"] if other != slug]
+    return {"name": spec["name"], "slug": slug, "user": USER_PLACEHOLDER,
+            "links": here + elsewhere, "signIn": "/login",
+            "signOut": "/logout"}
+
+
+def picker_payload(reg: dict) -> dict:
+    """Payload for the picker, which belongs to no partition: its links are the
+    partition list, from the same registry the cards and the proxies came from.
+
+    `slug` is null because no partition is implied, and the identity comes from
+    hubauth's slug-free /whoami (gateway.conf's soft gate on `= /`), so an
+    anonymous picker can still offer Sign in instead of pretending.
+    """
+    return {"name": "listen", "slug": None, "user": USER_PLACEHOLDER,
+            "links": [{"href": f"/l/{slug}/",
+                       "label": f'{reg["partitions"][slug]["name"]} (/{slug})'}
+                      for slug in reg["slugs"]],
+            "signIn": "/login", "signOut": "/logout"}
 
 
 def spa_shells(reg: dict) -> list[tuple[str, str]]:
     """Write one SPA shell per partition from the single built index.html.
 
-    Two rewrites, both forced by serving one Angular build from many mounts:
+    Three rewrites, all forced by serving one Angular build from many mounts:
     the <base href> becomes this partition's prefix (the app derives its
-    apiUrl, its cache/ polls and its stream URLs from exactly that value), and
-    every relative bundle ref is made root-absolute (absolutize_refs). The
-    identity script is written AFTER a CLOSED <base> tag: text placed inside
-    an unclosed `<base ... ` is swallowed into the start tag by the HTML
-    parser, so a <script> that has not been closed never executes - which is
-    how the previous version of this function silently shipped neither a
-    partition base href nor __HUB__.
+    apiUrl, its cache/ polls and its stream URLs from exactly that value),
+    every relative bundle ref is made root-absolute (absolutize_refs), and the
+    dock payload is written into the <head>. The identity script is written
+    AFTER a CLOSED <base> tag: text placed inside an unclosed `<base ... ` is
+    swallowed into the start tag by the HTML parser, so a <script> that has not
+    been closed never executes - which is how the previous version of this
+    function silently shipped neither a partition base href nor __HUB__.
     """
     built = f"{SPA_WWW}/index.html.dist"
     try:
@@ -907,19 +1089,30 @@ def spa_shells(reg: dict) -> list[tuple[str, str]]:
     _, _, rest = tail.partition(">")     # the tag's own '>' is consumed here
     out = []
     for slug in reg["slugs"]:
+        payload = dock_payload(f"/l/{slug}", slug, reg["partitions"][slug], reg)
         out.append((f"{SPA_WWW}/l/{slug}/index.html",
                     f'{head}<base href="/l/{slug}/">'
-                    f'{HUB_SCRIPT.format(slug=slug)}{rest}'))
+                    f'{dock_block(payload)}{rest}'))
     if reg["front"]:
         # Front partition at the portal root too (base href "/"), for callers
         # that already have the app cached at root; the picker owns `/` itself.
+        payload = dock_payload("", reg["front"],
+                               reg["partitions"][reg["front"]], reg)
         out.append((f"{SPA_WWW}/index.html",
                     f'{head}<base href="/">'
-                    f'{HUB_SCRIPT.format(slug=reg["front"])}{rest}'))
+                    f'{dock_block(payload)}{rest}'))
     return out
+
+
 def picker_html(reg: dict) -> str:
     """The public door: links to every partition from the same registry that
-    drives the proxies, so a new partition appears here without a rebuild."""
+    drives the proxies, so a new partition appears here without a rebuild.
+
+    The dock rides in the <head> with the picker's own payload (see
+    picker_payload): the cards below are the same list, but a signed-in visitor
+    gets the tab that carries their identity and the surfaces they can go back
+    to, and an anonymous one gets Sign in instead of a dead end.
+    """
     hosts = vault_hosts(reg)
     cards = []
     for slug in reg["slugs"]:
@@ -950,7 +1143,8 @@ def picker_html(reg: dict) -> str:
             f'    </a>')
     return ("<!doctype html>\n<html lang=en>\n<head>\n<meta charset=utf-8>\n"
             "<meta name=viewport content=\"width=device-width,initial-scale=1\">\n"
-            "<title>listen</title>\n<link rel=stylesheet href=/hub.css>\n</head>\n<body>\n"
+            "<title>listen</title>\n<link rel=stylesheet href=/hub.css>\n"
+            f"{dock_block(picker_payload(reg), conf=False)}\n</head>\n<body>\n"
             "<header><h1>listen</h1>"
             "<nav><a href=/login>Log in</a> <a href=/pair>Pair a device</a></nav></header>\n"
             "<main>\n  <section class=cards>\n" + "\n".join(cards) + "\n  </section>\n"

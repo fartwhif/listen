@@ -1,0 +1,163 @@
+/* Hub dock: the collapsed navigation tab that sits on every page of the stack.
+   Self-contained - own --hk-* tokens, no hub.css, no fonts, no images. Selectors are
+   scoped to #hk-dock or hk-*, so they cannot collide with the styles GrabbyTube,
+   FrogRock and noVNC also carry on these pages. */
+
+#hk-dock {
+  /* Dark chrome is the default; the light block below swaps every token. */
+  --hk-ink: #eceff4;
+  --hk-chrome: rgba(24, 26, 31, .92);
+  --hk-hover: rgba(255, 255, 255, .10);
+  --hk-edge: rgba(255, 255, 255, .20);
+  --hk-accent: #7cc4ff;
+  --hk-shadow: 0 2px 10px rgba(0, 0, 0, .35);
+
+  /* The wrapper holds the fixed geometry so the open panel can sit beside the tab; the
+     34px tab is its first child, so the tab itself stays on the left edge, centred.
+     The portal's z-indexes are <= 100 and GrabbyTube's toast is bottom-left, so 9000
+     clears app chrome without hiding behind a modal. */
+  position: fixed;
+  top: 50%;
+  left: 0;
+  transform: translateY(-50%);
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  /* Closed, the wrapper must not swallow pointer events over page content. */
+  pointer-events: none;
+  color: var(--hk-ink, #eceff4);
+  font: 500 13px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+@media (prefers-color-scheme: light) {
+  #hk-dock {
+    --hk-ink: #22262d;
+    --hk-chrome: rgba(250, 251, 252, .94);
+    --hk-hover: rgba(0, 0, 0, .07);
+    --hk-edge: rgba(0, 0, 0, .22);
+    --hk-accent: #0a66c2;
+    --hk-shadow: 0 2px 10px rgba(0, 0, 0, .18);
+  }
+}
+
+#hk-dock * {
+  box-sizing: border-box;
+}
+
+.hk-tab {
+  pointer-events: auto;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--hk-edge, rgba(150, 150, 150, .35));
+  border-radius: 50%;
+  background: var(--hk-chrome, rgba(30, 33, 38, .9));
+  /* currentColor glyph: the tab follows the ink token, no second colour to keep in step. */
+  color: inherit;
+  box-shadow: var(--hk-shadow, 0 2px 10px rgba(0, 0, 0, .3));
+  font: inherit;
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.hk-closed .hk-tab {
+  opacity: .82;
+}
+
+/* The mirror of the dimmed closed tab: the class swap is the whole state
+   machine, so an open dock's tab is as loud as a hovered one. */
+.hk-open .hk-tab {
+  opacity: 1;
+}
+
+.hk-tab:hover,
+.hk-tab:focus-visible {
+  opacity: 1;
+  background: var(--hk-hover, rgba(128, 128, 128, .18));
+}
+
+.hk-tab:focus-visible {
+  outline: 2px solid var(--hk-accent, #4c9fe0);
+  outline-offset: 1px;
+}
+
+.hk-panel {
+  pointer-events: auto;
+  flex: 0 0 auto;
+  width: 160px;
+  margin-left: 6px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  background: var(--hk-chrome, rgba(30, 33, 38, .9));
+  border: 1px solid var(--hk-edge, rgba(150, 150, 150, .35));
+  border-radius: 10px;
+  box-shadow: var(--hk-shadow, 0 2px 10px rgba(0, 0, 0, .3));
+}
+
+/* display:flex would otherwise override the UA [hidden] rule. */
+.hk-closed .hk-panel,
+.hk-panel[hidden] {
+  display: none;
+}
+
+/* Heading rows: only rendered when the config carries that value. */
+.hk-brand,
+.hk-user {
+  padding: 4px 9px;
+  overflow-wrap: anywhere;
+}
+
+.hk-brand {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.hk-user {
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  opacity: .72;
+}
+
+/* A divider when both rows are present. */
+.hk-brand + .hk-user {
+  border-top: 1px solid var(--hk-edge, rgba(150, 150, 150, .35));
+  border-radius: 2px;
+}
+
+.hk-link {
+  display: block;
+  padding: 7px 9px;
+  border-radius: 6px;
+  color: inherit;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.hk-link:hover,
+.hk-link:focus-visible {
+  background: var(--hk-hover, rgba(128, 128, 128, .18));
+}
+
+.hk-active {
+  color: var(--hk-accent, #4c9fe0);
+  background: var(--hk-hover, rgba(128, 128, 128, .18));
+  font-weight: 700;
+}
+
+/* Narrow screens keep the tab (a bit smaller) and cap the panel's height. */
+@media (max-width: 639px) {
+  .hk-tab {
+    width: 30px;
+    height: 30px;
+    font-size: 15px;
+  }
+
+  .hk-panel {
+    max-height: 70vh;
+    overflow: auto;
+  }
+}

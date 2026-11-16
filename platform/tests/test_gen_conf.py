@@ -34,6 +34,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+import gzip
 import pytest
 
 from conftest import nginx_required
@@ -604,6 +605,21 @@ def locations(body: str):
     return out
 
 
+def location_blocks(body: str) -> dict:
+    """{(kind, name): block_text} - kind-aware, because a name legitimately
+    appears twice: `= {prefix}/grabby/` is the app page (with the dock filter)
+    and `^~ {prefix}/grabby/` the API beneath it. `dict(locations(body))` keeps
+    whichever came LAST, so a filter count taken from it can be a count of the
+    mount while being read as a count of the page."""
+    out = {}
+    for m in LOC_RE.finditer(body):
+        name = m.group("name") or ""
+        if name.startswith('"') and name.endswith('"'):
+            name = name[1:-1]
+        out[((m.group("kind") or "").strip(), name)] = m.group("body")
+    return out
+
+
 def test_locations_emits_both_prefixes_and_front_aliases(two):
     body = gen.nginx_locations(two)
     names = [n for n, _ in locations(body)]
@@ -639,29 +655,41 @@ def test_prefix_modifiers_are_plain_exactly_where_a_regex_sibling_must_win(two):
     nested location is searched only after its parent prefix wins), and
     `/library/`, `/grabby/` and the SPA shell prefix gain the protection - an
     Angular route like `/l/<slug>/library` must not be re-routed by a sibling
-    regex. `/vnc/` is the one name that appears TWICE on purpose: an EXACT
-    location answers the door itself (a prefix location with a directory
-    candidate dies in nginx's directory-index phase and bounces a signed-in
-    member to /login) and the `^~` prefix serves the noVNC tree under it.
+    regex. THREE names appear twice on purpose, each an EXACT location answering
+    a page ABOVE the prefix that carries everything under it: `/vnc/` (a prefix
+    location with a directory candidate dies in nginx's directory-index phase
+    and bounces a signed-in member to /login, so the door answers itself and
+    `^~` serves the noVNC tree), plus `/grabby/` and `/radio/`, whose pages
+    carry a dock filter that must not run over the API responses beneath them.
     """
     kinds: dict[str, set] = {}
+    seen: dict[tuple[str, str], int] = {}
     for m in LOC_RE.finditer(gen.nginx_locations(two)):
         name = m.group("name") or ""
         if name.startswith('"') and name.endswith('"'):
             name = name[1:-1]
-        kinds.setdefault(name, set()).add((m.group("kind") or "").strip())
+        kind = (m.group("kind") or "").strip()
+        kinds.setdefault(name, set()).add(kind)
+        seen[(kind, name)] = seen.get((kind, name), 0) + 1
+    # The mount, not the page, is what has to stay plain: an exact location only
+    # wins for its own URI, so the page blocks do not change this requirement.
     for pre in ("/l/owner", "/l/family", ""):            # "" = front's bare form
         for suffix in ("/api/", "/radio/"):
-            assert kinds[f"{pre}{suffix}"] == {""}, f"{pre}{suffix} must be plain"
-    for suffix in ("/cache/", "/library/", "/grabby/", "/"):
+            name = f"{pre}{suffix}"
+            assert "" in kinds[name], f"{name} needs a plain mount"
+            assert "^~" not in kinds[name], f"{name} must not be ^~"
+    assert kinds["/l/owner/api/"] == {""}
+    for suffix in ("/cache/", "/library/", "/"):
         assert kinds[f"/l/owner{suffix}"] == {"^~"}, suffix
-    assert kinds["/l/owner/vnc/"] == {"=", "^~"}
-    assert kinds["/vnc/"] == {"=", "^~"}
-    # The bare aliases come from the FRONT partition only: a second partition
-    # emitting `/api/` would be a duplicate location and nginx -t fails outright.
-    for bare in ("/api/", "/cache/", "/library/", "/radio/", "/grabby/",
-                 "/vnc/"):
-        assert list(kinds).count(bare) == 1, bare
+    for name in ("/l/owner/grabby/", "/l/family/grabby/", "/grabby/",
+                 "/l/owner/vnc/", "/vnc/"):
+        assert kinds[name] == {"=", "^~"}, name
+    # The bare aliases come from the FRONT partition only, and no location may
+    # be emitted twice: a duplicate `= /grabby/` is a fatal nginx -t error, and
+    # a second partition claiming the root is how it would happen.
+    for (kind, name), count in sorted(seen.items()):
+        if name and not name.startswith(("/l/", "^")):
+            assert count == 1, (kind, name)
     assert "/" not in kinds          # `/` is the picker's, not a partition's
 
 
@@ -670,7 +698,7 @@ def test_every_partition_path_is_gated(two):
     reachable without a session."""
     for slug in ("owner", "family"):
         body = gen._locations(slug, f"/l/{slug}", gen.ports(
-            two["partitions"][slug]["index"]), two["partitions"][slug])
+            two["partitions"][slug]["index"]), two["partitions"][slug], two)
         for name, block in locations(body):
             serves = ("proxy_pass" in block or "alias " in block
                       or "root " in block)
@@ -893,6 +921,316 @@ def test_absolutize_refs_leaves_absolute_and_attribute_values_alone():
     assert "https://x/y" in out and "data:,a" in out and "#frag" in out
     assert 'src="/keep/me.png"' in out and 'media="print"' in out
     assert "this.href='x'" in out
+
+
+# ---------------------------------------------------------------- the dock
+# The dock is one <link> + two <script> tags and a JSON payload (window.__HUB__).
+# It reaches every browsable page of the stack through two routes - written into
+# pages gen-conf owns (picker, SPA shells) and injected by sub_filter into pages
+# an app serves (the player, GrabbyTube's index, the noVNC door) - and it is the
+# ONLY thing in the stack that must work across a partition mount without any app
+# cooperating. So the tests here are about the payload surviving two hostile
+# homes (a <script> body, an nginx config string) and about the tags landing
+# exactly once per page.
+NASTY = {"owner": 'Ra"dio', "family": "Q's $afe <b>"}
+
+
+def _nasty(tmp_path, monkeypatch):
+    """The two-partition registry with operator-supplied names that each end a
+    string early somewhere: `"` in a JS/JSON literal and in nginx's replacement
+    quotes, `'` in nginx's single-quoted strings, `<` in `</script>` and `$` in
+    nginx's interpolation - all four are legal in a partition name."""
+    reg = json.loads(json.dumps(TWO))
+    for slug, name in NASTY.items():
+        reg["partitions"][slug]["name"] = name
+    registry(tmp_path, reg, monkeypatch)
+    monkeypatch.setattr(gen, "DATA", str(tmp_path / "data"))
+    return gen.load_registry()
+
+
+def _nginx_unquote(body: str) -> str:
+    """nginx's own double-quote resolution: a backslash escapes whatever follows
+    it, and nothing else is special except `$` (interpolated, which no generated
+    payload contains). A payload is only safe in a config string if this scan
+    hands back exactly the JSON the payload was built from."""
+    out, i = [], 0
+    while i < len(body):
+        if body[i] == "\\" and i + 1 < len(body):
+            out.append(body[i + 1])
+            i += 2
+        else:
+            out.append(body[i])
+            i += 1
+    return "".join(out)
+
+
+def _payload_of(text: str) -> dict:
+    """The window.__HUB__ object out of a page or a resolved filter string."""
+    start = text.index("window.__HUB__") + len("window.__HUB__")
+    end = text.index("</script>", start) if "</script>" in text[start:] else len(text)
+    # `window.__HUB__=`: the assignment is the marker, so the object literal
+    # starts one character later; the injected form ends with `;` before the
+    # closing tag.
+    return json.loads(text[start + 1:end].rstrip(";"))
+
+
+def test_dock_json_escapes_what_ends_a_string_early(two):
+    pay = gen.dock_payload("/l/family", "family", two["partitions"]["family"], two)
+    pay = {**pay, "name": NASTY["family"]}
+    page = gen.dock_json(pay)
+    conf = gen.dock_json(pay, conf=True)
+    for raw, esc in (("'", "\\u0027"), ("$", "\\u0024"), ("<", "\\u003c")):
+        assert raw not in pay["name"] or raw in json.dumps(pay["name"])
+        assert esc in page, raw
+        assert esc in conf, raw
+    # The browser-side form is plain JSON with the three extras: json.loads
+    # round-trips it because \u0027 is the same character as '.
+    assert _payload_of(f"<script>window.__HUB__={page}</script>")["name"] == \
+        NASTY["family"]
+    # Resolution is what proves the doubling: unquoting with nginx's own rule has
+    # to hand back the browser form with the placeholder swapped for the name the
+    # gate interpolates - the same text in a <script> is valid JavaScript.
+    resolved = _nginx_unquote(conf)
+    assert resolved == page.replace(f'"{gen.USER_PLACEHOLDER}"', f'"{gen.USER_VAR}"')
+    assert '"user":"$gate_user"' in resolved
+    assert _payload_of(f"<script>window.__HUB__={resolved}</script>")["name"] == \
+        NASTY["family"]
+    assert gen.USER_PLACEHOLDER not in conf
+
+
+def test_injected_dock_payload_survives_nginx_quote_resolution(tmp_path,
+                                                               monkeypatch):
+    """The one property a syntax check cannot make fail.
+
+    `nginx -t` accepts any bytes inside a double-quoted string; what it does with
+    them is decided later, when sub_filter already holds the resolved text. A
+    payload that resolved to something other than the JSON it was built from is a
+    page whose own inline script is not valid JavaScript - silent, per-partition
+    and invisible to every check the entrypoint runs. So: unquote every generated
+    filter string exactly the way nginx does, fill the identity variable, and
+    parse it. Names carry `"`, `'`, `$` and `<` (see _nasty)."""
+    reg = _nasty(tmp_path, monkeypatch)
+    body = gen.nginx_locations(reg)
+    lines = [l.strip() for l in body.splitlines()
+             if l.strip().startswith('sub_filter "</head>"')]
+    # one per app page (player, grabby index, noVNC door) per alias set: mounted
+    # front, mounted family, bare front. Each of those pages now lives in an
+    # exact location of its own, so its filter never runs over the JSON that the
+    # same prefix carries.
+    assert len(lines) == 9, lines
+    for line in lines:
+        assert line.startswith('sub_filter "</head>" "') and line.endswith('";'), line
+        resolved = _nginx_unquote(line[len('sub_filter "</head>" "'):-2])
+        pay = _payload_of(resolved.replace(gen.USER_VAR, "kid"))
+        assert pay["slug"] in NASTY, pay
+        assert pay["name"] == NASTY[pay["slug"]], (line, pay["name"])
+        assert pay["user"] == "kid", pay
+        assert pay["signIn"] == "/login" and pay["signOut"] == "/logout", pay
+        # every href is mount-absolute, so a link cannot be reached only from one
+        # alias set: the mounted page names /l/<slug>/…, the bare one names /…
+        for link in pay["links"]:
+            assert link["href"].startswith("/"), link
+
+
+def test_file_written_dock_payload_is_plain_json(tmp_path, monkeypatch):
+    """The picker and the shells are the same payload without nginx in the way:
+    json.loads of the text AS WRITTEN must parse, with the placeholder where the
+    identity goes (sub_filter replaces it at serve time, so a file that already
+    named someone would show the wrong name to whoever read it cached)."""
+    reg = _nasty(tmp_path, monkeypatch)
+    for text in (gen.picker_html(reg), gen.dock_block(
+            gen.dock_payload("/l/owner", "owner", reg["partitions"]["owner"],
+                             reg))):
+        pay = _payload_of(text)
+        assert pay["user"] == gen.USER_PLACEHOLDER, pay
+        assert pay["slug"] in (None, "owner"), pay
+        want = "listen" if pay["slug"] is None else NASTY["owner"]
+        assert pay["name"] == want, pay
+
+
+def test_dock_tags_are_deferred_and_root_absolute(two):
+    """Exactly one stylesheet, one inline payload and one deferred script, with
+    no `type=` on either script.
+
+    `defer` is what makes injection at `</head>` enough (dock.js needs a <body>
+    to hang the tab from) while the payload still runs before any app bootstrap,
+    and no `type=` because a module script would run too late and a
+    `type=text/…` script not at all - the same tags have to behave the same in a
+    page gen-conf wrote and in a proxied app document.
+    """
+    pay = gen.dock_payload("/l/family", "family", two["partitions"]["family"], two)
+    block = gen.dock_block(pay)
+    assert block.count("<link rel=stylesheet href=/dock.css>") == 1
+    assert block.count('<script src=/dock.js defer></script>') == 1
+    assert block.count("<script>") == 1 and " type=" not in block
+    assert block.index("window.__HUB__") > block.index("<link")
+    # root-absolute in every home: a page at /l/family/grabby/ has a different
+    # <base>, and the dock is what reaches across mounts.
+    # Unquoted and root-absolute: the same bytes have to survive inside a
+    # proxied upstream document and inside an nginx replacement string, and a
+    # page at /l/family/grabby/ has a different <base> than the portal root.
+    assert "href=/dock.css" in block and "src=/dock.js" in block
+    # Nothing may name the two files WITHOUT the slash: that would be a relative
+    # ref, resolved against the page's <base>, which differs per mount.
+    assert "dock." not in block.replace("=/dock.css", "").replace("=/dock.js", "")
+
+
+def test_dock_payload_lists_its_own_surfaces_first_and_every_mount(two):
+    own = gen.dock_payload("/l/family", "family", two["partitions"]["family"], two)
+    hrefs = [l["href"] for l in own["links"]]
+    assert hrefs[:4] == ["/l/family/", "/l/family/radio/", "/l/family/grabby/",
+                         "/l/family/vnc/"], hrefs
+    # the other partitions always in their mounted form, which exists for the
+    # front too, so no link depends on which alias set is mounted
+    assert hrefs[4:] == ["/l/owner/"], hrefs
+    front = gen.dock_payload("", "owner", two["partitions"]["owner"], two)
+    assert [l["href"] for l in front["links"]][:4] == ["/", "/radio/", "/grabby/",
+                                                       "/vnc/"]
+    assert [l["href"] for l in front["links"]][4:] == ["/l/family/"]
+    # a partition with radio off does not offer a surface that would 404
+    silent = {**two["partitions"]["family"], "radio": False}
+    assert "/l/family/radio/" not in [l["href"] for l in
+                                      gen.dock_payload("/l/family", "family",
+                                                       silent, two)["links"]]
+
+
+def test_picker_payload_lists_the_partitions_and_names_no_mount(two):
+    pay = gen.picker_payload(two)
+    assert pay["slug"] is None
+    assert [l["href"] for l in pay["links"]] == ["/l/owner/", "/l/family/"]
+    assert [l["label"] for l in pay["links"]] == ["Home (/owner)",
+                                                  "Family (/family)"]
+    assert pay["user"] == gen.USER_PLACEHOLDER
+    # the picker's cards come from the same registry, in the same order
+    picker = gen.picker_html(two)
+    assert re.findall(r'<a class="card" href="(/l/[a-z0-9_-]+/)">', picker) == \
+        [l["href"] for l in pay["links"]]
+
+
+def test_picker_carries_the_dock_once_and_the_doors_do_not(two):
+    """The picker gets the dock; the three auth doors get only hub.css/hub.js.
+
+    A door's only dock link would be "Sign in" on the page whose whole job is
+    signing in, and the doors already carry a brand link and each other. The
+    picker is different: a signed-in visitor has an identity to see and surfaces
+    to go back to, and an anonymous one gets a door instead of a dead end.
+    """
+    picker = gen.picker_html(two)
+    assert picker.count("window.__HUB__") == 1
+    assert picker.count("<link rel=stylesheet href=/dock.css>") == 1
+    assert picker.index("</head>") > picker.index("window.__HUB__")
+    assert '<link rel=stylesheet href=/hub.css>' in picker
+    for name, body in gen.auth_pages(two):
+        assert "window.__HUB__" not in body, name
+        assert "/dock." not in body, name
+        assert '<link rel=stylesheet href=/hub.css>' in body, name
+
+
+def test_dock_filter_lands_on_app_pages_only(two):
+    """Per location: one filter per page, none on the API or media beneath it.
+
+    `= {prefix}/radio/`, `= {prefix}/grabby/` and `= {prefix}/vnc/` are the three
+    app pages a partition owns, and each gets exactly one `sub_filter "</head>"`;
+    the stream, the player/grabby APIs, the cache and library trees and the SPA
+    shell get none of it. A filter over a whole mount would rewrite JSON bodies
+    too - status.json carries a track title, and GrabbyTube's index carries a
+    `</head>` inside its own body - and one page growing a second dock is what
+    `sub_filter_once on` is for.
+    """
+    body = gen.nginx_locations(two)
+    kb = location_blocks(body)
+    for key in sorted(("=", pre + suffix) for pre in ("/l/owner", "/l/family", "")
+                      for suffix in ("/radio/", "/grabby/")):
+        b = kb[key]
+        assert b.count('sub_filter "</head>"') == 1, key
+        assert 'proxy_set_header Accept-Encoding "";' in b, key
+        assert "sub_filter_once on;" in b, key
+        assert "gzip off" not in b, (key, "mount-wide gzip off is a regression")
+    door = kb[("=", "/l/owner/vnc/")]
+    assert door.count('sub_filter "</head>"') == 1
+    assert door.count("sub_filter_once on;") == 1
+    assert "gzip off" in door, "the door serves from disk and must stay raw"
+    assert 'proxy_set_header Accept-Encoding' not in door, "no upstream to ask"
+    # its own ws-path rewrite is still there, and still the only other filter
+    assert door.count("sub_filter ") == 2, door
+    assert "readQueryVariable('path', 'l/owner/vnc/websockify')" in door
+    assert kb[("=", "/l/family/vnc/")].count(
+        "readQueryVariable('path', 'l/family/vnc/websockify')") == 1
+    for key in (("", "/l/family/api/"), ("^~", "/l/family/cache/"),
+                ("^~", "/l/family/library/"),
+                ("~", r"^/l/family/radio/stream(?:\.mp3)?"),
+                ("^~", "/l/family/vnc/"), ("^~", "/l/family/"),
+                ("", "/api/"), ("^~", "/cache/"),
+                ("~", r"^/radio/stream(?:\.mp3)?")):
+        assert 'sub_filter "</head>"' not in kb[key], key
+    # the shell keeps its identity placeholder filter and nothing else
+    shell = kb[("^~", "/l/family/")]
+    assert shell.count("sub_filter ") == 1 and "__HUB_USER__" in shell
+
+
+def test_gateway_serves_the_dock_assets_and_soft_gates_the_picker():
+    """What the dock needs from the gateway, asserted as config: the two assets
+    on ungated root locations, a slug-free identity internal for the picker's
+    soft gate, and `gzip off` on the picker because sub_filter refuses a
+    compressed body and the picker's placeholder is what fills the dock."""
+    conf = open(f"{REPO}/nginx/gateway.conf").read()
+    for loc in ("location = /dock.css", "location = /dock.js"):
+        block = conf[conf.index(loc):conf.index("}", conf.index(loc))]
+        assert "root /var/www/hub;" in block, loc
+        assert '"no-cache"' in block, loc
+    who = conf[conf.index("location = /_whoami"):]
+    who = who[:who.index("\n    }")]
+    assert "internal;" in who, "/_whoami must not be a public path"
+    assert "proxy_pass http://127.0.0.1:8099/whoami;" in who
+    assert "$" not in who.split("proxy_pass")[1], "no variables in the target"
+    j = conf.index("location = / {")          # the picker, not `/login` etc.
+    picker = conf[j:conf.index("}", j)]
+    assert "auth_request /_whoami;" in picker
+    assert "auth_request_set $gate_user $upstream_http_x_user;" in picker
+    assert "gzip off;" in picker and "sub_filter __HUB_USER__ $gate_user;" in picker
+    # the assets the dock's tags name are the files the image ships
+    for name in ("dock.css", "dock.js"):
+        assert (pathlib.Path(REPO) / "hub" / name).exists(), name
+    # The step that puts them in the image. Asserted from the source tree; from
+    # INSIDE the image (which does not copy the Dockerfile) by the COPY target
+    # holding the repo's bytes, so the assertion is real in both homes.
+    dockerfile = pathlib.Path(REPO, "Dockerfile")
+    if dockerfile.exists():
+        assert "hub/dock.css hub/dock.js" in dockerfile.read_text(), \
+            "dock assets are not in the image build"
+    else:
+        for name in ("dock.css", "dock.js"):
+            baked = pathlib.Path("/var/www/hub", name)
+            assert baked.read_bytes() == \
+                (pathlib.Path(REPO, "hub", name)).read_bytes(), name
+
+
+def test_dock_js_renders_only_from_a_payload_and_offers_next():
+    """The client half: no config no dock, and a `next` hint the server honours.
+
+    hubauth.login_target accepts a `next` only inside the prefix of the partition
+    the login names, so dock.js composes one only on a page that sits inside a
+    mount (`/l/<slug>/`), never on the picker (`slug: null`) or on the front's
+    bare aliases - where it would be dropped anyway. Everything is built with
+    createElement/textContent so a partition label cannot inject markup.
+    """
+    src = (pathlib.Path(REPO) / "hub" / "dock.js").read_text()
+    assert "window.__HUB__" in src and "document.body.appendChild" in src
+    assert "innerHTML" not in src, "textContent only: labels hold & < \""
+    assert "?next=" in src and "encodeURIComponent" in src
+    assert "cfg.slug ?" in src, "next only inside a partition mount"
+    assert "indexOf(mount) === 0" in src
+    assert "<script" not in src and "document.write" not in src
+    css = (pathlib.Path(REPO) / "hub" / "dock.css").read_text()
+    for sel in ("#hk-dock", ".hk-tab", ".hk-panel", ".hk-link", ".hk-open",
+                ".hk-closed", ".hk-user", ".hk-brand"):
+        assert sel in css, sel
+    # The tab and panel appear with a class swap and a `hidden` attribute, so
+    # there is nothing to animate, and that IS the invariant worth keeping: a
+    # chrome overlay that starts animating on its own over a page that is
+    # streaming audio has to opt into prefers-reduced-motion explicitly.
+    for decl in ("transition", "animation", "@keyframes"):
+        assert decl not in css, decl
 
 
 def test_picker_and_auth_pages_agree_with_the_registry(two):
@@ -1272,32 +1610,103 @@ def _relocate(text, serve_port, stub_port, hub_www, spa_www):
 
 def _stub_hubauth(port):
     """A hubauth stand-in: `GET /gate/<slug>` answers the gate's contract,
-    everything else answers 200 JSON.
+    `GET /whoami` answers the PICKER's contract, everything else answers 200 JSON.
 
     `server.allow_gate` is read per request so a test can put identity on the
     wire mid-test without rebinding the port: the gate answers 200 + X-User +
     X-Partition-Slug when it is True (request goes through) and 401 when it is
     False (the location's own error_page decides what the client sees).
+
+    The picker's soft gate needs the OTHER shape, and the two differ in one
+    number that decides whether the page is served at all: a refused gate is 401
+    for a partition (its error_page turns it into the login bounce or the JSON
+    challenge) and 204 for the picker, because nobody is signed in on the portal
+    root yet and the partition list is the whole point of the page. The stub
+    mimics that exactly, including the header name nginx reads (`X-User`, which
+    becomes `$gate_user` through auth_request_set).
+
+    `probe=html` on a non-gate path asks for a small HTML APP PAGE instead of
+    JSON, gzipped when the caller offered Accept-Encoding. That is the one thing
+    the dock's proxied page blocks can be tested against: the upstream is the
+    app, its HTML is what the filter rewrites, and whether it arrives compressed
+    is decided by the request's Accept-Encoding - which is exactly the header the
+    page blocks clear. The switch rides in the query because a location's
+    `proxy_pass` rewrites the PATH (the mount comes off) while nginx appends the
+    original query string verbatim, so `/l/owner/grabby/?probe=html` reaches the
+    upstream as `/?probe=html` and the harness can ask the same upstream about a
+    page location and a mount path in one run.
     """
+    import gzip
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     class Handler(BaseHTTPRequestHandler):
         def _answer(self):
-            gated = self.path.startswith("/gate")
+            path, _, query = self.path.partition("?")
+            gated = path.startswith("/gate")
+            whoami = path == "/whoami"
             allow = getattr(self.server, "allow_gate", False)
-            body = b"" if gated else b'{"ok":true,"user":"owner"}'
-            self.send_response(200 if (allow or not gated) else 401)
+            extra = {}
+            if gated or whoami:
+                # 200 + identity when the caller has one, 401 for a partition
+                # gate that does not, 204 for the picker's (which must never
+                # 401: nginx would refuse the page it is gating).
+                status = 200 if allow else (204 if whoami else 401)
+                body = b""
+                if allow:
+                    extra["X-User"] = "owner"
+                    if gated:
+                        extra["X-Partition-Slug"] = path.split("/")[2]
+                    else:
+                        extra["Content-Type"] = "application/json"
+                        body = b'{"username":"owner","slug":"owner"}'
+            elif "probe=html" in query:
+                status = 200
+                extra["Content-Type"] = "text/html"
+                # Echo the value nginx forwarded upstream so a test can SEE
+                # `proxy_set_header Accept-Encoding ""` instead of inferring it
+                # from a missing dock: upstream response headers pass through a
+                # proxy location untouched, and the stub below gzips exactly when
+                # this says gzip.
+                extra["X-Saw-Accept-Encoding"] = \
+                    self.headers.get("Accept-Encoding", "")
+                # `morehead=1` mimics the app pages whose BODY carries the
+                # search token - a track title or an error string holding a
+                # literal `</head>` - which is what `sub_filter_once on` is for.
+                junk = "</head>" if "morehead" in query else ""
+                body = ("<!doctype html><html lang=en><head>"
+                        "<meta charset=utf-8><title>App</title></head>"
+                        f"<body><main>app{junk}</main></body></html>\n").encode()
+            else:
+                status = 200
+                extra["Content-Type"] = "application/json"
+                body = b'{"ok":true,"user":"owner"}'
+            # An APP page is gzipped when the caller offered it, because that is
+            # what these apps do (measured: FrogRock's player and GrabbyTube's
+            # index both arrive Content-Encoding: gzip from their own servers).
+            # A body that reaches nginx compressed is one sub_filter refuses, so
+            # this is what makes `Accept-Encoding ""` falsifiable instead of
+            # decorative - and never for an auth subrequest, which has to stay a
+            # plain 204/200 for the gate to read it.
+            gzipped = status == 200 and not (gated or whoami) and \
+                "gzip" in self.headers.get("Accept-Encoding", "")
+            if gzipped:
+                body = gzip.compress(body, 9)
+                extra["Content-Encoding"] = "gzip"
+            self.send_response(status)
             self.send_header("Content-Length", str(len(body)))
-            if not gated:
-                self.send_header("Content-Type", "application/json")
-            elif allow:
-                self.send_header("X-User", "owner")
-                self.send_header("X-Partition-Slug", self.path.split("/")[2])
+            for name, value in extra.items():
+                self.send_header(name, value)
             self.end_headers()
             if body:
                 self.wfile.write(body)
 
+        # The responder answers every verb the harness and nginx use, because
+        # BaseHTTPRequestHandler replies 501 "Unsupported method" to anything it
+        # has no do_<VERB> for: an `auth_request` subrequest is a GET, so without
+        # these aliases every gated path died as "auth request unexpected status:
+        # 501" in the error log and a 500 to the client. HEAD is aliased for
+        # symmetry with the probe callers; the harness itself never sends one.
         do_GET = do_POST = do_HEAD = _answer
 
         def log_message(self, *args):
@@ -1349,10 +1758,14 @@ def _serve(tmp_path, monkeypatch, start_identity):
     # must come out partition-specific, and one module under it, which must NOT
     # be rewritten (its own `ws://host/websockify` fallback contains the same
     # bare string).
+    # The real vnc_lite.html closes its <head> (measured in the image: one
+    # `</head>` in 6.3 KB), so the fixture does too - otherwise the door's dock
+    # filter would have nothing to attach to and a served assertion about it
+    # would be about the fixture, not the page.
     (novnc / "vnc_lite.html").write_text(
-        "<!doctype html><title>noVNC</title>\n"
-        "<script>const path = readQueryVariable('path', 'websockify');\n"
-        "url += '/' + path;</script>\n")
+        "<!doctype html><html><head><title>noVNC</title></head>\n"
+        "<body><script>const path = readQueryVariable('path', 'websockify');\n"
+        "url += '/' + path;</script></body></html>\n")
     (novnc / "core/rfb.js").write_text(
         "this._socket.open('ws://' + host + '/websockify');\n")
     for attr, value in (("DATA", data), ("HUB_WWW", hub_www),
@@ -1396,6 +1809,12 @@ def _serve(tmp_path, monkeypatch, start_identity):
     # the files the gateway's static locations read
     (hub_www / "hub.js").write_text("// hub\n")
     (hub_www / "hub.css").write_text(":root{color:red}\n")
+    # dock.css/dock.js go in as the REAL repo bytes, not stub strings: the
+    # served dock test compares what nginx hands out against the file the image
+    # ships, and a stub could not prove the location reaches it.
+    for asset in ("dock.css", "dock.js"):
+        (hub_www / asset).write_bytes(
+            pathlib.Path(REPO, "hub", asset).read_bytes())
     (hub_www / "robots.txt").write_text("User-agent: *\n")
     for path, body in gen.auth_pages(reg):
         open(path, "w").write(body)
@@ -2179,6 +2598,142 @@ def test_served_vault_door_answers_itself_for_a_member(served_two):
     parts = urllib.parse.urlsplit(hdr.get("Location", ""))
     assert (parts.path == "/l/owner/vnc/vnc_lite.html"
             and parts.query == "pass=x"), hdr
+
+    log = (env["tmp"] / "error.log").read_text()
+    assert not log.strip(), log
+
+
+@nginx_required
+def test_served_dock_lands_on_every_page_shape(served_two):
+    """Injection, escaping and the soft gate ON THE WIRE - the half that
+    `nginx -t` and the generated-text tests cannot reach.
+
+    A `sub_filter` can be perfectly well-formed and still put no dock on a page:
+    the body arrived compressed (the filter refuses a gzipped body), the search
+    token is not in what the upstream serves, `sub_filter_once` was never
+    inherited, or compression ate the picker's placeholder replacement. Every one
+    of those answers 200 with a plausible-looking body, and `nginx -t` says
+    nothing about any of them. So this asks a live nginx for the three page
+    shapes and checks the payload is THERE, exactly once, naming the gate's user:
+
+      1. the picker        (file + SOFT gate + placeholder sub_filter)
+      2. a proxied app page (exact location + `Accept-Encoding ""` + `</head>`
+         injection, over an upstream that gzips its own HTML)
+      3. the noVNC door    (disk + `gzip off` + two filters in one block)
+
+    `/_whoami` is proved unreachable at the same time: `internal;` is what keeps
+    the picker's gate target from being a public identity endpoint, and only a
+    live server tells that apart from an ordinary 404.
+    """
+    env = served_two
+    port = env["port"]
+    gz_offer = {"Accept-Encoding": "gzip"}
+
+    # ---- the dock's own pair: ungated, no-cache, byte-identical to the repo --
+    # Never served as text/html: dock.js arrives through a `src=`, and a browser
+    # refuses to run a script whose response is HTML.
+    for asset, ctype in (("/dock.css", "text/css"),
+                         ("/dock.js", "application/javascript")):
+        status, hdr, body = _fetch(port, asset)
+        assert status == 200, (asset, status, body[:120])
+        assert hdr.get("Cache-Control") == "no-cache", hdr
+        assert hdr.get("Content-Type", "").startswith(ctype), hdr
+        if hdr.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)   # the server's compression, not a bug
+        want = pathlib.Path(REPO, "hub", asset[1:]).read_bytes()
+        assert body == want, (asset, "served bytes differ from the repo file")
+
+    # The picker's identity target is not reachable from outside.
+    status, _, _ = _fetch(port, "/_whoami")
+    assert status == 404, status
+
+    # ---- 1. the picker, anonymously: soft gate must still serve the page ----
+    # hubauth's /whoami answers 204 here, and a 401 target would bounce every
+    # visitor to the login form instead of showing them the partitions. The
+    # placeholder becomes the EMPTY string, so the dock offers Sign in rather
+    # than rendering `__HUB_USER__` as a username.
+    status, hdr, body = _fetch(port, "/")
+    assert status == 200, (status, body[:200])
+    assert gen.USER_PLACEHOLDER.encode() not in body, body[:200]
+    assert body.count(b'"user":""') == 1, body[:200]
+    assert body.count(b"window.__HUB__") == 1, body[:200]
+    # `gzip off` on this location is load-bearing, and the assertion that proves
+    # it is the control beside it: the picker file is above the server's
+    # gzip_min_length, so with gzip left on this body would arrive compressed and
+    # sub_filter would refuse it (placeholder and all). /dock.css is the same
+    # server, same gzip, no `gzip off` - it must come back compressed.
+    picker_len = len((env["www"] / "hub" / "index.html").read_bytes())
+    assert picker_len > 1024, f"control needs a body gzip would take: {picker_len}"
+    status, hdr, body = _fetch(port, "/", headers=gz_offer)
+    assert hdr.get("Content-Encoding") is None, hdr
+    assert gen.USER_PLACEHOLDER.encode() not in body, body[:200]
+    status, hdr, _ = _fetch(port, "/dock.css", headers=gz_offer)
+    assert status == 200 and hdr.get("Content-Encoding") == "gzip", hdr
+
+    # ---- 2. signed-in picker: the gate's name lands in the payload ----
+    env["srv"].allow_gate = True
+    status, hdr, body = _fetch(port, "/")
+    assert status == 200, (status, body[:200])
+    assert body.count(b'"user":"owner"') == 1, body[:200]
+    pay = _payload_of(body.decode())
+    assert pay["slug"] is None and pay["user"] == "owner", pay
+    assert [l["href"] for l in pay["links"]] == ["/l/owner/", "/l/family/"], pay
+
+    # ---- 3. proxied APP page: injected once, over an upstream that gzips ----
+    # The stub gzips exactly when the request offered it (which is what these
+    # apps do - measured: FrogRock's player and GrabbyTube's index both arrive
+    # Content-Encoding: gzip) and echoes the header it saw. `Accept-Encoding ""`
+    # means the stub sees nothing and leaves the body uncompressed for the
+    # filter; the mount under the SAME prefix keeps the client's header and is
+    # the control that says the empty value came from this block, not nginx.
+    for pre, slug in (("/l/owner", "owner"), ("/l/family", "family"),
+                      ("", "owner")):            # "" = front's bare aliases
+        status, hdr, body = _fetch(port, f"{pre}/grabby/?probe=html",
+                                   headers=gz_offer)
+        assert status == 200, (pre, status, body[:120])
+        assert hdr.get("X-Saw-Accept-Encoding") == "", (pre, hdr)
+        if hdr.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+        text = body.decode()
+        assert text.count("window.__HUB__") == 1, (pre, text[:200])
+        pay = _payload_of(text)
+        assert pay["slug"] == slug and pay["user"] == "owner", (pre, pay)
+        assert pay["name"] == env["reg"]["partitions"][slug]["name"], pay
+        # mount-absolute hrefs: the dock is the one thing that reaches ACROSS
+        # mounts, from a page whose own <base> names somewhere else entirely.
+        assert all(l["href"].startswith("/") for l in pay["links"]), pay
+        # a body that ALSO contains the search token (a track title holding a
+        # literal `</head>`, which is what GrabbyTube's index does) still grows
+        # exactly one dock: `sub_filter_once on` per page block.
+        status, hdr, body = _fetch(port, f"{pre}/grabby/?probe=html&morehead=1",
+                                   headers=gz_offer)
+        if hdr.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+        assert body.count(b"window.__HUB__") == 1, (pre, body[:200])
+
+    # The control, same upstream and same offering, through the MOUNT: the
+    # header survives, the stub gzips, and no dock appears - the exact failure
+    # `proxy_set_header Accept-Encoding ""` exists to prevent.
+    status, hdr, body = _fetch(port, "/l/owner/grabby/static/x?probe=html",
+                               headers=gz_offer)
+    assert "gzip" in hdr.get("X-Saw-Accept-Encoding", ""), (status, hdr)
+    assert hdr.get("Content-Encoding") == "gzip", hdr
+    assert b"window.__HUB__" not in gzip.decompress(body), body[:200]
+
+    # ---- 4. the noVNC door: a dock beside the ws-path rewrite ----
+    # Two sub_filters in one block, from disk, with `gzip off`: the stock path
+    # rewrite and the dock must both land.
+    status, hdr, body = _fetch(port, "/l/owner/vnc/")
+    assert status == 200, (status, body[:120])
+    assert b"<title>noVNC" in body, body[:120]
+    assert hdr.get("Content-Encoding") is None, hdr
+    assert body.count(b"window.__HUB__") == 1, body[:300]
+    assert _payload_of(body.decode())["slug"] == "owner", body[:300]
+
+    # A dock on a page is the feature; a dock inside an API response is a broken
+    # payload. The mounts carry the apps' JSON with no filter at all.
+    status, hdr, body = _fetch(port, "/l/owner/api/cache/status")
+    assert status == 200 and b"window.__HUB__" not in body, (status, body[:120])
 
     log = (env["tmp"] / "error.log").read_text()
     assert not log.strip(), log

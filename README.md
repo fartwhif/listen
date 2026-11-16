@@ -134,6 +134,35 @@ keystrokes post the form and hubauth answers a browser `Accept: text/html` with
 the 302 into the partition. Either way the password rides in the request body,
 never in the URL.
 
+## The nav dock
+
+Every browsable page carries one collapsed tab (`#hk-dock`) that names the
+partitions, so a page under `/l/family/grabby/` can still get you home or to
+another tenant without any app knowing the hub exists. `hub/dock.css` +
+`hub/dock.js` are served ungated at the portal root (like `hub.css`) and are
+referenced root-absolute; their content comes from one JSON payload,
+`window.__HUB__`, which `gen-conf.py` either **writes** into a page it owns (the
+picker, the SPA shells) or hands to nginx as a `sub_filter` that appends the
+three tags after the upstream's `</head>` (the radio player, GrabbyTube's index,
+the noVNC door).
+
+Two details are load-bearing, and both are asserted against a live nginx in
+`platform/tests/test_gen_conf.py`:
+
+- `proxy_set_header Accept-Encoding ""` on the injected page blocks:
+  `sub_filter` refuses a compressed body, and every app here gzips its own HTML.
+  gzip stays ON so `/radio/api/status.json` and noVNC's `core/rfb.js` are not
+  shipped raw; the filter only needs the body uncompressed on the way in.
+- the payload's `user` is nobody until the page's own gate answers, so the
+  file-written form carries `__HUB_USER__` (replaced by the picker's own
+  `sub_filter`, which is why that location needs `gzip off`) and the injected
+  form carries `$gate_user`, filled by the same `auth_request_set` that names
+  `X-User` for the APIs. The picker is gated SOFTLY through the internal
+  `/_whoami` (hubauth's slug-free identity: 204 for an anonymous browser, so the
+  partition list is never walled) and `dock.js` offers Sign in with `?next=` of
+  the current page only when that page sits inside a mount of the partition the
+  payload is about — the only `next` values hubauth honours.
+
 ## Operator CLI
 
 `hub` is the only writer of the registry and the identity DB from the shell. It

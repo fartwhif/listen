@@ -106,6 +106,23 @@ class Hub(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def send_empty(self, code: int = 204) -> None:
+        """A bodyless answer, for the soft whoami's "nobody is asking as anyone".
+
+        204 and not 401 because `auth_request` treats ANY 2xx as ALLOW: measured
+        against nginx 1.22, a 401 from the gate subrequest fails the parent
+        request outright - `proxy_intercept_errors on` does not intercept it and
+        `error_page 401 =204` on the gate location rewrites the PARENT's status,
+        not the subrequest's. So "anonymous" has to be an allow that names no
+        user: the page is served, and the parent's
+        `auth_request_set $gate_user $upstream_http_x_user` finds the header
+        missing and renders an empty string.
+        """
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
     def send_json(self, code: int, body: dict, extra: dict | None = None) -> None:
         data = json.dumps(body).encode()
         self.send_response(code)
@@ -277,6 +294,8 @@ class Hub(BaseHTTPRequestHandler):
             return self.send_json(200, {"ok": True, "service": "hubauth"})
         if u.path.startswith("/gate/"):
             return self.handle_gate(u.path[len("/gate/"):])
+        if u.path == "/whoami":
+            return self.handle_whoami()
         if u.path == "/me":
             q = parse_qs(u.query)
             slug = q.get("slug", [""])[0]
@@ -299,6 +318,35 @@ class Hub(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         self.do_GET()
+
+    def handle_whoami(self) -> None:
+        """Slug-free identity for the dock on the PUBLIC picker page.
+
+        The gate answers per partition, and the picker is none's: it lists them
+        all. This is the one question the picker needs answered - "does this
+        browser belong to anybody, and if so whom" - with a partition-agnostic
+        yes/no, so the nav dock on an anonymous page can still say Sign in
+        instead of pretending everyone is signed in.
+
+        A session names its own partition (identify() fills the gap from the
+        session's binding), so the slug header comes back with the name: the
+        picker's dock can then link straight to the partition this browser
+        belongs to. An api key is bound to a user and to no partition, so it
+        names the user and leaves the slug out. A ?pass= stream listener names
+        nobody even here: the allowance is scoped to the stream path, and
+        /whoami is not it.
+        """
+        username, _reason, eff = self.identify("")
+        if not username:
+            # 204, not 401: on the gateway this is an auth_request target and
+            # 401 would refuse the page (see send_empty). The direct caller
+            # reads it the same way: no identity, nothing to say.
+            return self.send_empty(204)
+        extra = {"X-User": username}
+        if eff:
+            extra["X-Partition-Slug"] = eff
+        return self.send_json(200, {"username": username, "slug": eff or None},
+                              extra)
 
     def handle_gate(self, slug: str) -> None:
         """auth_request target. nginx asks "may this request into partition
