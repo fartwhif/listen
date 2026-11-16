@@ -1013,11 +1013,11 @@ def test_injected_dock_payload_survives_nginx_quote_resolution(tmp_path,
     body = gen.nginx_locations(reg)
     lines = [l.strip() for l in body.splitlines()
              if l.strip().startswith('sub_filter "</head>"')]
-    # one per app page (player, grabby index, noVNC door) per alias set: mounted
-    # front, mounted family, bare front. Each of those pages now lives in an
-    # exact location of its own, so its filter never runs over the JSON that the
-    # same prefix carries.
-    assert len(lines) == 9, lines
+    # one per app page (player, grabby index, noVNC door, noVNC tree) per alias
+    # set: mounted front, mounted family, bare front. Each of those pages now
+    # lives in an exact location of its own, so its filter never runs over the
+    # JSON that the same prefix carries.
+    assert len(lines) == 12, lines
     for line in lines:
         assert line.startswith('sub_filter "</head>" "') and line.endswith('";'), line
         resolved = _nginx_unquote(line[len('sub_filter "</head>" "'):-2])
@@ -1129,13 +1129,24 @@ def test_picker_carries_the_dock_once_and_the_doors_do_not(two):
 def test_dock_filter_lands_on_app_pages_only(two):
     """Per location: one filter per page, none on the API or media beneath it.
 
-    `= {prefix}/radio/`, `= {prefix}/grabby/` and `= {prefix}/vnc/` are the three
-    app pages a partition owns, and each gets exactly one `sub_filter "</head>"`;
-    the stream, the player/grabby APIs, the cache and library trees and the SPA
-    shell get none of it. A filter over a whole mount would rewrite JSON bodies
-    too - status.json carries a track title, and GrabbyTube's index carries a
+    `= {prefix}/radio/`, `= {prefix}/grabby/` and the two served noVNC blocks
+    (`= {prefix}/vnc/` and `^~ {prefix}/vnc/`) are the app pages a partition
+    owns, and each gets exactly one `sub_filter "</head>"`; the stream, the
+    player/grabby APIs, the cache and library trees and the SPA shell get none
+    of it. A filter over a whole mount would rewrite JSON bodies too -
+    status.json carries a track title, and GrabbyTube's index carries a
     `</head>` inside its own body - and one page growing a second dock is what
     `sub_filter_once on` is for.
+
+    The noVNC tree DOES carry the filters, and that is the deliberate exception:
+    it answers the release's three HTML pages (vnc.html, its vnc_auto.html
+    symlink, vnc_lite.html), and the door URL and the picker's link reach the
+    same document by different paths. A filter on one shape only makes those two
+    disagree about whether there is a dock and where the socket is. Its scope is
+    nginx's default `sub_filter_types text/html`, left undeclared on purpose: the
+    .js and .css under the tree keep their ETags and 304s (core/rfb.js is 105 KB
+    gzipped), which is also why the full UI's default in app/ui.js gets its own
+    exact location instead of a mount-wide JavaScript filter.
     """
     body = gen.nginx_locations(two)
     kb = location_blocks(body)
@@ -1146,23 +1157,46 @@ def test_dock_filter_lands_on_app_pages_only(two):
         assert 'proxy_set_header Accept-Encoding "";' in b, key
         assert "sub_filter_once on;" in b, key
         assert "gzip off" not in b, (key, "mount-wide gzip off is a regression")
-    door = kb[("=", "/l/owner/vnc/")]
-    assert door.count('sub_filter "</head>"') == 1
-    assert door.count("sub_filter_once on;") == 1
-    assert "gzip off" in door, "the door serves from disk and must stay raw"
-    assert 'proxy_set_header Accept-Encoding' not in door, "no upstream to ask"
-    # its own ws-path rewrite is still there, and still the only other filter
-    assert door.count("sub_filter ") == 2, door
-    assert "readQueryVariable('path', 'l/owner/vnc/websockify')" in door
-    assert kb[("=", "/l/family/vnc/")].count(
-        "readQueryVariable('path', 'l/family/vnc/websockify')") == 1
+    # door + tree: same page, so the same filters; disk-served, so no
+    # Accept-Encoding to negotiate and no gzip off either (for a FILE body nginx
+    # runs sub_filter before gzip).
+    for key in (("=", "/l/owner/vnc/"), ("^~", "/l/owner/vnc/"),
+                ("=", "/vnc/"), ("^~", "/vnc/")):
+        b = kb[key]
+        assert b.count('sub_filter "</head>"') == 1, key
+        assert b.count("sub_filter_once on;") == 1, key
+        assert "gzip off" not in b, key
+        assert 'proxy_set_header Accept-Encoding' not in b, (
+            key, "no upstream to ask")
+        assert b.count("sub_filter ") == 2, (key, "lite default + dock only")
+        assert "sub_filter_types" not in b, (
+            key, "the tree's filter must stay HTML-only")
+    # the lite page's default becomes THIS mount's socket path, in both shapes
+    for pre, mount in (("/l/owner", "l/owner/"), ("/l/family", "l/family/"),
+                       ("", "")):
+        for kind in ("=", "^~"):
+            assert f"readQueryVariable('path', '{mount}vnc/websockify')" \
+                   in kb[(kind, f"{pre}/vnc/")], (kind, pre)
+    # …and the full UI's default, in its module, which is the only block here
+    # that filters JavaScript at all
+    for pre, mount in (("/l/owner", "l/owner/"), ("/l/family", "l/family/"),
+                       ("", "")):
+        ui = kb[("=", f"{pre}/vnc/app/ui.js")]
+        assert f"UI.initSetting('path', '{mount}vnc/websockify');" in ui, pre
+        assert ui.count("sub_filter ") == 1, pre
+        assert 'sub_filter "</head>"' not in ui, (pre, "ui.js is not a page")
+        assert "sub_filter_types application/javascript;" in ui, pre
+        assert "try_files /app/ui.js =404;" in ui, pre
     for key in (("", "/l/family/api/"), ("^~", "/l/family/cache/"),
                 ("^~", "/l/family/library/"),
                 ("~", r"^/l/family/radio/stream(?:\.mp3)?"),
-                ("^~", "/l/family/vnc/"), ("^~", "/l/family/"),
                 ("", "/api/"), ("^~", "/cache/"),
                 ("~", r"^/radio/stream(?:\.mp3)?")):
         assert 'sub_filter "</head>"' not in kb[key], key
+    # nothing anywhere else turns off compression to feed a filter
+    for key, b in kb.items():
+        if "sub_filter " in b:
+            assert "gzip off" not in b, key
     # the shell keeps its identity placeholder filter and nothing else
     shell = kb[("^~", "/l/family/")]
     assert shell.count("sub_filter ") == 1 and "__HUB_USER__" in shell
@@ -1171,8 +1205,9 @@ def test_dock_filter_lands_on_app_pages_only(two):
 def test_gateway_serves_the_dock_assets_and_soft_gates_the_picker():
     """What the dock needs from the gateway, asserted as config: the two assets
     on ungated root locations, a slug-free identity internal for the picker's
-    soft gate, and `gzip off` on the picker because sub_filter refuses a
-    compressed body and the picker's placeholder is what fills the dock."""
+    soft gate, and compression left ON everywhere - including the picker, whose
+    placeholder filter runs before gzip because its body comes from a file (see
+    the rationale at `location = /` in nginx/gateway.conf)."""
     conf = open(f"{REPO}/nginx/gateway.conf").read()
     for loc in ("location = /dock.css", "location = /dock.js"):
         block = conf[conf.index(loc):conf.index("}", conf.index(loc))]
@@ -1187,7 +1222,13 @@ def test_gateway_serves_the_dock_assets_and_soft_gates_the_picker():
     picker = conf[j:conf.index("}", j)]
     assert "auth_request /_whoami;" in picker
     assert "auth_request_set $gate_user $upstream_http_x_user;" in picker
-    assert "gzip off;" in picker and "sub_filter __HUB_USER__ $gate_user;" in picker
+    assert "sub_filter __HUB_USER__ $gate_user;" in picker
+    # and nothing in the gateway turns compression off to feed a filter any more.
+    # Directives only: the rationale quoted in a comment names the very directive
+    # it rejects, so a substring scan of the whole file would report its own text.
+    off = [l.strip() for l in conf.splitlines()
+           if "gzip off" in l and not l.lstrip().startswith("#")]
+    assert not off, f"a gzip off came back: {off}"
     # the assets the dock's tags name are the files the image ships
     for name in ("dock.css", "dock.js"):
         assert (pathlib.Path(REPO) / "hub" / name).exists(), name
@@ -1754,20 +1795,41 @@ def _serve(tmp_path, monkeypatch, start_identity):
     spa_www.mkdir(parents=True)
     novnc = tmp_path / "novnc"
     (novnc / "core").mkdir(parents=True)
-    # The two forms the door serves: the lite page, whose stock default ws path
-    # must come out partition-specific, and one module under it, which must NOT
-    # be rewritten (its own `ws://host/websockify` fallback contains the same
-    # bare string).
-    # The real vnc_lite.html closes its <head> (measured in the image: one
-    # `</head>` in 6.3 KB), so the fixture does too - otherwise the door's dock
-    # filter would have nothing to attach to and a served assertion about it
-    # would be about the fixture, not the page.
+    (novnc / "app").mkdir()
+    # The three HTML forms the release actually ships, plus the one module that
+    # holds the FULL UI's websocket default. Shapes copied from the shipped tree
+    # (measured: vnc.html 15 212 B with one `</head>`, its default at
+    # `UI.initSetting('path', 'websockify');` inside app/ui.js line 175 of 1715,
+    # and that default's only other appearance being the lite page's own copy;
+    # vnc_auto.html a symlink to vnc.html; vnc_lite.html 6 323 B with one
+    # `</head>` and its default in a `readQueryVariable('path', …)` call). The
+    # fixture keeps those token shapes because the config's whole job is to hit
+    # each of them in the right file and nowhere else: rfb.js's own
+    # `ws://host/websockify` fallback carries the same bare string and must
+    # survive byte-for-byte.
+    #
+    # Every body is padded past the server's gzip_min_length (1024) on purpose.
+    # The served tests make real claims about compression - that a filtered body
+    # still leaves gzipped, and that the UNFILTERED module keeps its ETag and
+    # answers 304 - and a 130-byte fixture would satisfy all of them for a body
+    # gzip never looked at. The padding carries none of the search tokens.
+    _pad = "// filler so a real filter and a real gzip both run on this body\n"
+    pad = _pad * 40                       # 3 000 B, well past 1 024
     (novnc / "vnc_lite.html").write_text(
         "<!doctype html><html><head><title>noVNC</title></head>\n"
         "<body><script>const path = readQueryVariable('path', 'websockify');\n"
-        "url += '/' + path;</script></body></html>\n")
+        "url += '/' + path;" + pad + "</script></body></html>\n")
+    (novnc / "vnc.html").write_text(
+        "<!doctype html><html><head><title>noVNC full</title></head>\n"
+        '<body><script type="module" src="app/ui.js"></script>'
+        + pad + "</body></html>\n")
+    os.symlink("vnc.html", novnc / "vnc_auto.html")     # as the release ships it
+    (novnc / "app/ui.js").write_text(
+        "// the lite page has its own copy: readQueryVariable('path', "
+        "'websockify')\n"
+        "UI.initSetting('path', 'websockify');\n" + pad)
     (novnc / "core/rfb.js").write_text(
-        "this._socket.open('ws://' + host + '/websockify');\n")
+        "this._socket.open('ws://' + host + '/websockify');\n" + pad)
     for attr, value in (("DATA", data), ("HUB_WWW", hub_www),
                         ("SPA_WWW", spa_www), ("NOVNC_DIR", novnc),
                         ("STACK", tmp_path / "stack")):
@@ -2553,13 +2615,16 @@ def test_served_vault_door_answers_itself_for_a_member(served_two):
     The other half is the rewrite: rfb.js builds its websocket URL as
     scheme://host/ + path, so the page's stock default `websockify` aims at the
     portal root, where no partition is implied and the gate has no slug to
-    check. sub_filter replaces the default with this partition's path - but ONLY
-    in the door page, so rfb.js's own `/websockify` fallback (the same bare
-    string) survives.
+    check. sub_filter replaces the default with this partition's path - in the
+    lite page served by the door AND by the tree beneath it, and in the module
+    that holds the FULL UI's default - but nowhere else, so rfb.js's own
+    `/websockify` fallback (the same bare string) survives byte-for-byte.
     """
     env = served_two
     port = env["port"]
+    gz_offer = {"Accept-Encoding": "gzip"}
     stock = "readQueryVariable('path', 'websockify')"
+    stock_ui = "UI.initSetting('path', 'websockify');"
 
     # No session yet: the door is a page, so it bounces to the login form.
     status, hdr, _ = _fetch(port, "/l/owner/vnc/")
@@ -2569,15 +2634,36 @@ def test_served_vault_door_answers_itself_for_a_member(served_two):
     env["srv"].allow_gate = True
     for pre, mount in (("/l/owner", "l/owner/"), ("/l/family", "l/family/"),
                        ("", "")):                 # "" = front's bare door
-        status, hdr, body = _fetch(port, f"{pre}/vnc/")
-        assert status == 200, (pre, status, body[:120])
-        assert b"<title>noVNC" in body, (pre, body[:120])
-        assert stock.encode() not in body, (pre, "default ws path survived")
         want = ("readQueryVariable('path', '%svnc/websockify')"
                 % mount).encode()
-        assert want in body, (pre, body[body.find(b"path ="):][:120])
-        # served from the file, uncompressed (sub_filter skips gzip'd bodies)
-        assert hdr.get("Content-Encoding") is None, (pre, hdr)
+        # Both shapes that answer the lite page, because the picker links the
+        # door and the door URL the vault exports names the file under it.
+        for path in (f"{pre}/vnc/", f"{pre}/vnc/vnc_lite.html"):
+            status, hdr, body = _fetch(port, path)
+            assert status == 200, (path, status, body[:120])
+            assert b"<title>noVNC" in body, (path, body[:120])
+            assert stock.encode() not in body, (path, "default ws path survived")
+            assert want in body, (path, body[body.find(b"path ="):][:120])
+            # …and the FULL UI's, which lives in a module, not in the page: the
+            # exact {pre}/vnc/app/ui.js location is the only thing that rewrites
+            # it, so the tree beneath it must answer the stock form for every
+            # OTHER script.
+            status, hdr, body = _fetch(port, f"{pre}/vnc/app/ui.js")
+            assert status == 200, (path, status)
+            assert stock_ui.encode() not in body, (path, "ui.js default survived")
+            assert ("UI.initSetting('path', '%svnc/websockify');"
+                    % mount).encode() in body, path
+            assert hdr.get("Content-Type", "").startswith(
+                "application/javascript"), (path, hdr)
+            # A filtered body leaves gzipped when the caller offered it: for a
+            # body read from a FILE nginx runs sub_filter before gzip, so the
+            # rewrite and compression are not in conflict and nothing here needs
+            # `gzip off`. (Measured against nginx 1.22 in this image: 2 079 B of
+            # padded HTML out at Content-Encoding: gzip with the token replaced.)
+            status, hdr, body = _fetch(port, path, headers=gz_offer)
+            assert status == 200 and hdr.get("Content-Encoding") == "gzip", \
+                (path, hdr)
+            assert want in gzip.decompress(body), path
 
     # The tree under the door is FILE-ONLY: a miss is a 404, never the lite
     # page. A door that answers a missing .js with HTML is how a typo'd module
@@ -2591,6 +2677,29 @@ def test_served_vault_door_answers_itself_for_a_member(served_two):
         status, _, body = _fetch(port, path)
         assert status == 404, (path, status, body[:120])
         assert b"<title>noVNC" not in body, path
+
+    # Why the tree's filter is left at nginx's HTML-only default: a script under
+    # it must keep the validators noVNC's 105 KB rfb.js depends on, and the way
+    # to prove a filter did NOT run is that the body is untouched AND its ETag
+    # still answers 304. The exact ui.js block has no ETag for exactly this
+    # reason - a filtered file gets none (measured) - so the two assertions
+    # together say the scope is real in both directions.
+    rfb = "/l/owner/vnc/core/rfb.js"
+    want = (env["tmp"] / "novnc/core/rfb.js").read_bytes()
+    status, hdr, body = _fetch(port, rfb)
+    assert status == 200 and body == want, (status, "rfb.js rewritten")
+    etag = hdr.get("ETag")
+    assert etag, "the unfiltered module lost its ETag"
+    status, _, _ = _fetch(port, rfb, headers={"If-None-Match": etag})
+    assert status == 304, status
+    status, hdr, _ = _fetch(port, "/l/owner/vnc/app/ui.js")
+    # A filtered body gets NO content ETag at all (measured against this image's
+    # nginx), so the absence is the proof the filter ran on it.
+    assert "ETag" not in hdr, (hdr, "ui.js is filtered, so it must not be valid")
+    # …and a filtered body still compresses, so a 304 loss costs a re-download
+    # of 12 KB gzipped, not 58 KB.
+    status, hdr, _ = _fetch(port, "/l/owner/vnc/app/ui.js", headers=gz_offer)
+    assert hdr.get("Content-Encoding") == "gzip", hdr
 
     # The bare door still redirects to the lite page WITH its query intact.
     status, hdr, _ = _fetch(port, "/l/owner/vnc?pass=x")
@@ -2613,13 +2722,15 @@ def test_served_dock_lands_on_every_page_shape(served_two):
     token is not in what the upstream serves, `sub_filter_once` was never
     inherited, or compression ate the picker's placeholder replacement. Every one
     of those answers 200 with a plausible-looking body, and `nginx -t` says
-    nothing about any of them. So this asks a live nginx for the three page
+    nothing about any of them. So this asks a live nginx for the four page
     shapes and checks the payload is THERE, exactly once, naming the gate's user:
 
       1. the picker        (file + SOFT gate + placeholder sub_filter)
       2. a proxied app page (exact location + `Accept-Encoding ""` + `</head>`
          injection, over an upstream that gzips its own HTML)
-      3. the noVNC door    (disk + `gzip off` + two filters in one block)
+      3. the noVNC door    (disk, two filters in one block, gzip ON)
+      4. the noVNC tree    (the same page by its own path, plus the release's
+         scripts beneath it, where NO filter may run)
 
     `/_whoami` is proved unreachable at the same time: `internal;` is what keeps
     the picker's gate target from being a public identity endpoint, and only a
@@ -2657,16 +2768,24 @@ def test_served_dock_lands_on_every_page_shape(served_two):
     assert gen.USER_PLACEHOLDER.encode() not in body, body[:200]
     assert body.count(b'"user":""') == 1, body[:200]
     assert body.count(b"window.__HUB__") == 1, body[:200]
-    # `gzip off` on this location is load-bearing, and the assertion that proves
-    # it is the control beside it: the picker file is above the server's
-    # gzip_min_length, so with gzip left on this body would arrive compressed and
-    # sub_filter would refuse it (placeholder and all). /dock.css is the same
-    # server, same gzip, no `gzip off` - it must come back compressed.
+    # Compression is ON here and the placeholder still gets replaced, which is
+    # the property `gzip off` used to hide: nginx runs sub_filter BEFORE gzip for
+    # a body read from a FILE, so the picker leaves gzipped with an empty user.
+    # The file has to be above gzip_min_length for this to say anything, so the
+    # length is asserted rather than assumed.
     picker_len = len((env["www"] / "hub" / "index.html").read_bytes())
     assert picker_len > 1024, f"control needs a body gzip would take: {picker_len}"
     status, hdr, body = _fetch(port, "/", headers=gz_offer)
-    assert hdr.get("Content-Encoding") is None, hdr
+    assert hdr.get("Content-Encoding") == "gzip", hdr
+    body = gzip.decompress(body)
     assert gen.USER_PLACEHOLDER.encode() not in body, body[:200]
+    assert body.count(b'"user":""') == 1, body[:200]
+    assert body.count(b"window.__HUB__") == 1, body[:200]
+    # No Accept-Encoding offered: the same file goes out raw, so the compression
+    # above is negotiation and not a broken handler.
+    status, hdr, body = _fetch(port, "/")
+    assert hdr.get("Content-Encoding") is None, hdr
+    assert body.count(b'"user":""') == 1, body[:200]
     status, hdr, _ = _fetch(port, "/dock.css", headers=gz_offer)
     assert status == 200 and hdr.get("Content-Encoding") == "gzip", hdr
 
@@ -2720,15 +2839,42 @@ def test_served_dock_lands_on_every_page_shape(served_two):
     assert hdr.get("Content-Encoding") == "gzip", hdr
     assert b"window.__HUB__" not in gzip.decompress(body), body[:200]
 
-    # ---- 4. the noVNC door: a dock beside the ws-path rewrite ----
-    # Two sub_filters in one block, from disk, with `gzip off`: the stock path
-    # rewrite and the dock must both land.
-    status, hdr, body = _fetch(port, "/l/owner/vnc/")
-    assert status == 200, (status, body[:120])
-    assert b"<title>noVNC" in body, body[:120]
-    assert hdr.get("Content-Encoding") is None, hdr
-    assert body.count(b"window.__HUB__") == 1, body[:300]
-    assert _payload_of(body.decode())["slug"] == "owner", body[:300]
+    # ---- 4. the served noVNC: door, tree and the scripts beneath ----
+    # Two sub_filters in one block, from disk, with gzip left ON: the stock path
+    # rewrite and the dock must both land, on the door AND on the tree path that
+    # answers the same file, because the picker and the exported door URL differ
+    # only in which of the two they name.
+    for path in ("/l/owner/vnc/", "/l/owner/vnc/vnc_lite.html"):
+        status, hdr, body = _fetch(port, path)
+        assert status == 200, (path, status, body[:120])
+        assert b"<title>noVNC" in body, (path, body[:120])
+        assert hdr.get("Content-Encoding") is None, hdr
+        assert body.count(b"window.__HUB__") == 1, (path, body[:300])
+        assert _payload_of(body.decode())["slug"] == "owner", path
+        status, hdr, body = _fetch(port, path, headers=gz_offer)
+        assert hdr.get("Content-Encoding") == "gzip", (path, hdr)
+        body = gzip.decompress(body)
+        assert body.count(b"window.__HUB__") == 1, (path, body[:300])
+        assert _payload_of(body.decode())["slug"] == "owner", path
+    # The full UI's page (vnc.html, and its vnc_auto.html symlink) gets a dock
+    # through the TREE, where its own settings input is what names the socket -
+    # so no query string has to travel for the picker's "Desktop" tab to connect.
+    for path in ("/l/owner/vnc/vnc.html", "/l/owner/vnc/vnc_auto.html"):
+        status, hdr, body = _fetch(port, path)
+        assert status == 200, (path, status, body[:120])
+        assert b"<title>noVNC full" in body, (path, body[:120])
+        assert body.count(b"window.__HUB__") == 1, (path, body[:300])
+        assert _payload_of(body.decode())["slug"] == "owner", path
+    # A dock on a page; not on the page's SCRIPTS. ui.js is filtered for its one
+    # default and nothing else in it, and every other script under the tree is
+    # untouched - asserted by byte-identity plus a surviving ETag in the door
+    # test, and here by a dock that appears in no JavaScript body.
+    for path in ("/l/owner/vnc/core/rfb.js", "/l/owner/vnc/app/ui.js",
+                 "/l/family/vnc/core/rfb.js"):
+        status, hdr, body = _fetch(port, path, headers=gz_offer)
+        if hdr.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+        assert body.count(b"window.__HUB__") == 0, (path, status, body[:120])
 
     # A dock on a page is the feature; a dock inside an API response is a broken
     # payload. The mounts carry the apps' JSON with no filter at all.

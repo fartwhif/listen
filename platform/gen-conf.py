@@ -592,7 +592,8 @@ def dock_filter(payload: dict, proxied: bool = True) -> str:
     exists because a shorter version was proved to fail:
       `proxy_set_header Accept-Encoding ""` (proxy locations only) - sub_filter
         refuses a compressed body, and every app here gzips its own HTML for a
-        client that asks (FrogRock's player is 30 KB, GrabbyTube's index 12 KB).
+        client that asks (measured here: FrogRock's player is 31 013 B raw and
+        8 395 B gzipped, GrabbyTube's index 6 976 B raw and 2 245 B gzipped).
         Without it the filter silently does nothing and the page ships bare.
       `sub_filter_once on` - a page's head closes once; rewriting more than once
         is how a page whose BODY contains `</head>` (a track title in GrabbyTube's
@@ -603,20 +604,21 @@ def dock_filter(payload: dict, proxied: bool = True) -> str:
         double quotes nginx resolves `\\` and `\"` and interpolates `$`, which is
         exactly what the payload needs (see dock_json(conf=True)).
 
-    `proxied=False` is the noVNC door, which answers from disk: there is no
-    upstream to negotiate Accept-Encoding with, and that block already carries
-    `gzip off` (committed earlier, for its own ws-path rewrite), which is what
-    keeps the body uncompressed for the filter here too.
+    `proxied=False` is the served noVNC blocks (see novnc_filters): there is no
+    upstream to negotiate Accept-Encoding with, and nginx's own gzip is no
+    obstacle there - for a body read from a FILE, sub_filter runs BEFORE gzip in
+    the filter chain, so the replacement lands and the response still comes back
+    `Content-Encoding: gzip` (measured on this image: a 2.6 KB page-shaped file
+    went out at 140 B gzipped with its placeholder replaced). Nothing on the
+    disk-served blocks needs `gzip off`; only a body that arrives compressed
+    FROM AN UPSTREAM does, and that is what `Accept-Encoding ""` is for above.
 
-    NO `gzip off` on the proxy page blocks, deliberately: they are the page
-    blocks of mounts whose OTHER responses must stay compressed. FrogRock's
+    NO `gzip off` on the proxy page blocks either, deliberately: they are the
+    page blocks of mounts whose OTHER responses must stay compressed. FrogRock's
     `/radio/api/status.json` is 76 KB un-compressed and the player polls it, and
     noVNC's `core/rfb.js` is 105 KB; a mount-wide `gzip off` to satisfy the
     filter would ship both raw (measured on a 2.6 KB status body: 2642 B on the
-    wire with `gzip off`, 227 B with gzip left on). The page bodies gain ~250 B
-    and stay a few KB, so compressing them on the way out costs nothing - the
-    filter only needs the body UNCOMPRESSED ON THE WAY IN, and Accept-Encoding
-    "" guarantees that without touching what the client receives.
+    wire with `gzip off`, 227 B with gzip left on).
 
     The SEARCH token is the CLOSING `</head>`, not `<head>`: an app is free to
     give its opening tag attributes (`<head data-x="y">`, which FrogRock's player
@@ -628,6 +630,77 @@ def dock_filter(payload: dict, proxied: bool = True) -> str:
     ae = '    proxy_set_header Accept-Encoding "";\n' if proxied else ""
     return (ae + "    sub_filter_once on;\n"
             f'    sub_filter "</head>" "</head>{dock_block(payload, True)}";\n')
+
+
+# Where the stock noVNC release names its websocket path. Both rewrites exist
+# because a leading-slash or bare `websockify` path aims at the PORTAL ROOT,
+# where no partition is implied and the gate has no slug to check.
+VNC_LITE_DEFAULT = "readQueryVariable('path', 'websockify')"
+VNC_UI_DEFAULT = "UI.initSetting('path', 'websockify');"
+
+
+def vnc_ws_path(mount: str) -> str:
+    """The websocket path of one mount: "l/owner/vnc/websockify", or
+    "vnc/websockify" for the front's bare aliases.
+
+    NO leading slash, because rfb.js assembles the URL as scheme://host/ + path:
+    a slash-prefixed value would produce `ws://host//l/owner/...`.
+    """
+    return f"{mount}vnc/websockify"
+
+
+def novnc_filters(mount: str, payload: dict) -> str:
+    """The two rewrites every served noVNC HTML page of one mount needs.
+
+    The lite page's stock default is the token nginx replaces, and it is the
+    ONLY place `websockify` appears in vnc_lite.html (measured in the shipped
+    tree: one hit, at that default; vnc.html's is an `<input value=…>` and
+    core/rfb.js's is its own `ws://host/websockify` fallback). Filtered bodies
+    lose their ETag, so nginx's default `sub_filter_types text/html` is left
+    alone deliberately: the .js and .css under the tree keep their validators,
+    and core/rfb.js (105 544 B on disk, 21 792 B on the wire gzipped) does not
+    re-download on every door visit: unfiltered, it keeps its ETag and answers
+    304 to it.
+
+    The full UI gets no part of this: vnc.html sets its path input from
+    `UI.initSetting('path', …)` inside app/ui.js, so that one module has its own
+    location (see novnc_ui_filter) rather than the tree growing a JavaScript
+    filter that would strip the ETag from every script in the release.
+
+    `dock_filter(..., proxied=False)` rides along because the door and the tree
+    answer the SAME page (the picker links `/vnc/`, the door URL the vault
+    exports names `/vnc/vnc_lite.html`): filters in one shape only would make
+    the two disagree about whether there is a dock and where the socket is.
+    """
+    own = vnc_ws_path(mount)
+    return (dock_filter(payload, proxied=False)
+            + f"    sub_filter \"{VNC_LITE_DEFAULT}\""
+              f" \"readQueryVariable('path', '{own}')\";\n")
+
+
+def novnc_ui_filter(mount: str) -> str:
+    """The full UI's half of the same rewrite, scoped to app/ui.js alone.
+
+    `sub_filter_types` REPLACES the default list for its location, so this block
+    filters JavaScript and nothing else - and its try_files candidate is the one
+    .js file that needs it. The measured cost is ui.js (58 293 B on disk, 12 168 B
+    on the wire gzipped) losing its ETag, which nginx drops from any body it
+    filters (see the served door test): the benefit is that vnc.html and
+    vnc_auto.html connect to THIS partition's browser with no query string at
+    all, which is what a bookmark and the picker's "Desktop" tab produce.
+
+    Two semicolons end that line and only one of them is nginx's: the search
+    token is the whole JS statement, so the replacement has to carry its own
+    terminating semicolon or the module loses it to automatic semicolon
+    insertion, and the quoted replacement still needs the directive terminator
+    after its closing quote (without it nginx reads the next line as a third
+    argument and refuses the config).
+    """
+    own = vnc_ws_path(mount)
+    return ("    sub_filter_once on;\n"
+            "    sub_filter \"%s\" \"UI.initSetting('path', '%s');\";\n"
+            % (VNC_UI_DEFAULT, own)
+            + "    sub_filter_types application/javascript;\n")
 
 
 def _locations(slug: str, prefix: str, p: dict, spec: dict, reg: dict,
@@ -660,7 +733,6 @@ def _locations(slug: str, prefix: str, p: dict, spec: dict, reg: dict,
     # mounted page's links.
     dock_pay = dock_payload(prefix, slug, spec, reg)
     dock_page = dock_filter(dock_pay)                    # proxied app pages
-    dock_door = dock_filter(dock_pay, proxied=False)     # the noVNC door
     home = f"{DATA}/users/{slug}"
     out = [f"\n# ==== partition {slug}: {prefix or 'bare aliases'} ====\n"]
     if prefix:
@@ -770,47 +842,53 @@ def _locations(slug: str, prefix: str, p: dict, spec: dict, reg: dict,
     # Vault door (chromium starts on demand; the watchdog owns its life). The
     # stock Debian noVNC tree is served from UNDER the prefix so the lite page's
     # relative module imports (./core/rfb.js) resolve inside this prefix and
-    # stay gated. THREE locations, because two shapes were tried live in this
-    # container and each broke something:
+    # stay gated. FOUR locations, because the shapes that were tried live in
+    # this container each broke something, and because the release names its
+    # websocket path in two different places:
     #   `= {prefix}/vnc`  - the bare door, redirecting to the lite page with
-    #     whatever query came in (`?path=` is how the door URL names its own
-    #     websocket: rfb builds the URL as scheme://host/ + path, so the page's
-    #     stock default of `websockify` would aim at the portal ROOT, where no
-    #     partition is implied; vnc_door() always emits it).
-    #   `= {prefix}/vnc/` - the door WITH its slash, which is what a browser
-    #     gets from the picker and what the plan's check asks for (200 for a
-    #     member). A `try_files $uri $uri/ …` prefix location cannot answer
-    #     that: the directory candidate goes through nginx's directory-index
-    #     phase, `/usr/share/novnc/` has no index.html, so the request dies as
-    #     403 "directory index forbidden" and the location's own error_page
-    #     turns it into a login redirect - a member with a perfectly good
-    #     session bounced to /login. Serving the lite page from an EXACT
-    #     location whose single try_files candidate is a FILE skips that phase
-    #     entirely. sub_filter rewrites the page's default ws path to THIS
-    #     partition's, so a bookmark to the door with no query still connects;
-    #     sub_filter needs the body uncompressed, hence gzip off here only.
-    #     A sub_filter for the bare `websockify` string instead would have
-    #     rewritten rfb.js's own `ws://host/websockify` fallback too.
-    #   `^~ {prefix}/vnc/` - the static tree, with NO directory candidate at
-    #     all (`$uri =404`): NOVNC_DIR holds only the noVNC release, so every
-    #     real request is a file, and the `alias`+index combination
-    #     was worse than the bug it fixed - an appended index name produced
-    #     "vnc_lite.htmlindex.html is not a directory" (500) and then served
-    #     the lite page for every MISS, so a missing .js came back 200 with
-    #     HTML in it instead of 404.
+    #     whatever query came in (`?path=` is how the door URL the vault exports
+    #     names its own websocket: rfb builds the URL as scheme://host/ + path,
+    #     so the page's stock default of `websockify` would aim at the portal
+    #     ROOT, where no partition is implied; vnc_door() always emits it).
+    #   `= {prefix}/vnc/` - the door WITH its slash, which is what a browser gets
+    #     from the picker and what the plan's check asks for (200 for a member).
+    #     A `try_files $uri $uri/ …` prefix location cannot answer that: the
+    #     directory candidate goes through nginx's directory-index phase,
+    #     `/usr/share/novnc/` has no index.html, so the request dies as 403
+    #     "directory index forbidden" and the location's own error_page turns it
+    #     into a login redirect - a member with a perfectly good session bounced
+    #     to /login. Serving the lite page from an EXACT location whose single
+    #     try_files candidate is a FILE skips that phase entirely.
+    #   `= {prefix}/vnc/app/ui.js` - the full UI's path default, which lives in
+    #     that module (`UI.initSetting('path', 'websockify')` populates the
+    #     settings field), not in vnc.html. Its own location because the tree's
+    #     filter is HTML-only by nginx's default: widening it would take the
+    #     ETag from every script in the release - core/rfb.js (105 544 B) answers
+    #     304 to its own today, and every door visit would re-download it.
+    #   `^~ {prefix}/vnc/` - the static tree, with NO directory candidate at all
+    #     (`$uri =404`): NOVNC_DIR holds only the noVNC release, so every real
+    #     request is a file, and the `alias`+index combination was worse than
+    #     the bug it fixed - an appended index name produced "vnc_lite.htmlindex.
+    #     html is not a directory" (500) and then served the lite page for every
+    #     MISS, so a missing .js came back 200 with HTML in it instead of 404.
+    #     It carries the same filters as the door because it answers the same
+    #     three HTML pages (vnc.html, its vnc_auto.html symlink, vnc_lite.html):
+    #     a dock on the door only would make the two ways of reaching the lite
+    #     page disagree, and vnc.html is reachable only through the tree.
     mount = f"{prefix}/".lstrip("/")                 # "l/owner/" or "" at root
-    stock_path = "readQueryVariable('path', 'websockify')"
-    own_path = f"readQueryVariable('path', '{mount}vnc/websockify')"
     out.append(f"location = {prefix}/vnc {{\n{glogin}"
                f"    return 302 {prefix}/vnc/vnc_lite.html$is_args$args;\n}}\n")
     out.append(f"location = {prefix}/vnc/ {{\n{glogin}{GATE_USER_SET}"
                f"    alias {NOVNC_DIR}/;\n"
-               "    gzip off;\n"
-               f'    sub_filter "{stock_path}" "{own_path}";\n'
-               f"{dock_door}"
+               f"{novnc_filters(mount, dock_pay)}"
                "    try_files /vnc_lite.html =404;\n}\n")
-    out.append(f"location ^~ {prefix}/vnc/ {{\n{glogin}"
+    out.append(f"location = {prefix}/vnc/app/ui.js {{\n{glogin}"
                f"    alias {NOVNC_DIR}/;\n"
+               f"{novnc_ui_filter(mount)}"
+               "    try_files /app/ui.js =404;\n}\n")
+    out.append(f"location ^~ {prefix}/vnc/ {{\n{glogin}{GATE_USER_SET}"
+               f"    alias {NOVNC_DIR}/;\n"
+               f"{novnc_filters(mount, dock_pay)}"
                "    try_files $uri =404;\n}\n")
     out.append(f"location = {prefix}/vnc/websockify {{\n{gate}"
                f"    proxy_pass http://127.0.0.1:{ws_port or p['ws']};\n"
@@ -877,11 +955,19 @@ def _locations(slug: str, prefix: str, p: dict, spec: dict, reg: dict,
     # right base href) rather than escaping to another partition's shell.
     # gen-conf writes the shell from the built index.html with the partition's
     # base href; the gate's X-User is substituted into its identity placeholder
-    # so the app knows whose progress file is whose. gzip is off here because
-    # sub_filter skips compressed bodies, and the shell is ~2 KB anyway.
+    # so the app knows whose progress file is whose. NO `gzip off` here, even
+    # though this block sub_filters: for a body read from a FILE nginx runs
+    # sub_filter before gzip, so the replacement lands and the shell still
+    # leaves compressed (measured in this container: the 2 586 B built shell is
+    # 1 107 B gzipped on the wire, the 1 151 B picker 555 B). The shell is
+    # `no-cache`, so every mount re-fetches it on every navigation, and gzip is
+    # what makes that 1.1 KB instead of 2.6 KB; mount-wide `gzip off` to
+    # "help" the filter would
+    # also take compression away from everything else this prefix answers. The
+    # served test asserts the placeholder is replaced AND the body is gzipped,
+    # with the picker's own location as the control that gzip really runs.
     out.append(f"location ^~ {prefix}/ {{\n{glogin}"
                '    auth_request_set $gate_user $upstream_http_x_user;\n'
-               "    gzip off;\n"
                "    sub_filter_once on;\n"
                "    sub_filter __HUB_USER__ $gate_user;\n"
                f"    root {SPA_WWW};\n"
