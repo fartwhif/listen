@@ -13,8 +13,11 @@
   DB → `index.json` → `progress.json` consistency: ordering
   (`publishedAt desc, videoId asc`), set equality, audioPath resolvability
   for every non-ignored row, dead grabby-index refs (INFO only when the DB
-  row is ignored — the resolver/init exclude those by design). Run before
-  AND after a deploy; it is the "is content being missed" gate.
+  row is ignored — the resolver/init exclude those by design), and the grabby
+  **authorship marker** (A14/A14b: every `isGrabby` row must carry GrabbyTube's
+  `createdAt` sidecar marker and be listed in the authored index — a hard failure
+  either way). Run before AND after a deploy; it is the "is content being missed"
+  gate.
   CAUTION (2026-11-11): stored `Video.audioPath` values are the NEUTRAL container
   paths (`/cache/<id>/<id>.mp3`); the host-side audit maps them back onto this
   checkout via `hostPath()` — never compare a stored path to `ROOT/cache`
@@ -41,13 +44,28 @@
   before/after, and unwatch test-consumed rows with a direct SQLite
   `UPDATE Video SET watched=0, progress=0` (the index self-heals on the
   next harvest, seconds later).
-- **T4 — frontend liveness logic (pure, no browser, no network)**:
+- **T4 — frontend playback logic (pure, no browser, no network)**:
   `node tests/stall-guard.test.mjs` (~1 s). Compiles `frontend/src/app/stall-guard.ts`
   and drives the watchdog decision on simulated ticks: the `readyState 4`
   stale-buffer case (the real freeze), a load that never answers, scrubbing /
   paused / frozen-tab immunity, the 3-reload give-up cadence, and both resume
-  clocks (`stallResumeTarget`: element `currentTime` vs the laggy index copy).
-  No live system, no DB, no build.
+  clocks (`stallResumeTarget`: element `currentTime` vs the laggy index copy)
+  plus `streamTrackId(audio.src)` — the function that says WHICH track a
+  `currentTime` belongs to, which is what fixes the next-track inherits its
+  predecessor's position bug. No live system, no DB, no build.
+- **T5 — advance/resume browser E2E recipe** (headless Chromium + `--autoplay-policy=no-user-gesture-required`):
+  open the app, tag a short (≤150 s) queue row by id, click it (a trusted click
+  is what grants playback permission), then either await its `ended` event or
+  click a row whose id differs from the element's `src`. An auto-advanced track
+  that logs `Resumed <id> from <X>s` with X > 0 while X is not that track's own
+  saved progress is the bug. Prove the invariant both ways by serving the OLD
+  and NEW bundle side by side (`docker cp` the pre-fix `index.html` as
+  `old-index.html`, keep the fixed web root) — the buggy bundle reproduces
+  `Resumed cm7i62EE7T8 from 105.9s`/`from 80.0s` where the fixed one starts at
+  0. CAUTION: instrument the element with an `addInitScript` that wraps
+  `window.Audio` (`window.__audios`) BEFORE the goto; a `tab.run`/evaluate after
+  load is too late to observe the boot autoplay, and each headless SPA tab
+  writes progress/watched — zero or unwatch the touched rows afterwards.
 
 ## Workflow Reminders
 - Use `Task`/`explore` agents for complex searches.
@@ -139,6 +157,27 @@
   distribute (pull + recondition) and the pre-insert recheck. NEVER rewrite
   `grabby-index.json` — GrabbyTube owns it; its `audioPath` values go stale
   when its cache moves, which is why we resolve at read time.
+- **Ownership is the sidecar `createdAt` marker, never the folder or the index
+  listing** (2026-11-15): `cache/` is shared, so "the file is there" and
+  "grabby-index.json lists this videoId" are NOT evidence that an item is music.
+  GrabbyTube stamps `createdAt` into every sidecar it writes and nothing else in
+  that directory does, so `isGrabbyAuthored()` (index entries) /
+  `sidecarIsGrabbyAuthored()` (folders) are the single test at every decision:
+  cleanup orphan rule, bag seed, distribute candidate filter, startup revert,
+  T1 A14. The bare-sweep index that used `videoId`-key presence as ownership
+  catalogued 1,340 DrivePod videos as tracks and had already flipped 464 of them
+  to `isGrabby` — which reset watched/progress, faked their date (so auto-purge
+  never reached them) and hid their real artist. Consequences to preserve:
+  `distributeGrabbyItems` **refuses to convert an `isGrabby:false` row** (both at
+  candidate filtering, so the planner spends no slot on it and the entry rotates
+  back un-used, and again at placement, because a concurrent import can insert
+  the row in between), and `revertForeignGrabbyRows()` runs FIRST at startup —
+  before the bag seed, the artist backfill and the first harvest — restoring
+  `publishedAt`/`channelId` from the sidecar and recreating a deleted channel as
+  INACTIVE (re-activating it would silently resume harvesting). Missing or
+  unreadable sidecar ⇒ stays grabby: without evidence the mix label is safer.
+  T2 section 16 asserts all of it. GrabbyTube's own `update_index_file()` rebuilds
+  from the same marker, so its index lists only what it authored (2,057 → 717).
 - **Grabby timestamps are OURS, and the band is measured symmetrically**
   (2026-11-12): a grabby row's `publishedAt` is a `clusterTimestamp()` draw
   **inside** the band — at or below the newest normal video — never a real upload
@@ -264,9 +303,29 @@
   `currentTime` once metadata has landed, else the (10 s-laggy) index copy —
   computed BEFORE `src` is re-assigned, because the load algorithm wipes the
   position; resuming at 0 with a 28 MB retained buffer replays ~6 min of a
-  64 kbps mono track. NOTE: this is the *playback* watchdog; the similarly named
-  `Config.stallWindowMs` mechanism above is the *download* watchdog — different
-  problem, different file.
+  64 kbps mono track. Whether a load is a SAME-track load is decided by
+  `streamTrackId(this.audio.src) === video.videoId`, NEVER by `currentVideo`
+  (see the next bullet). NOTE: this is the *playback* watchdog; the similarly
+  named `Config.stallWindowMs` mechanism above is the *download* watchdog —
+  different problem, different file.
+
+- **"Same track" is a property of the ELEMENT, not of `currentVideo`**
+  (2026-11-15, see ARCHITECTURE.md §12.3): the app keeps one detached
+  `new Audio()`, and `_tryPlay` sets `currentVideo` to the candidate BEFORE its
+  HEAD probe resolves, while the `currentVideo -> null` effect that would clear
+  `audio.src` is scheduled after that set — so on every advance (`onended`,
+  `skipNext` with skip-marks-watched, `newest`/`oldest` autoplay, `_loadIndexAndPlay`)
+  the element still holds the track being left while `currentVideo` already
+  names the next one. `loadAndSeekVideo` used to derive `sameTrack` from
+  `currentVideo`, so the NEXT track looked like the same track and was seeked to
+  the finished track's position: any next track longer than the position being
+  left started partway through itself (a 28-minute item resumed at 1:45 after a
+  1:46 item ended; a row click inherited 80 s). Its side effect was also a spent
+  watchdog budget — an advance inherited the old track's `_stallRecoveries`.
+  `stall-guard.streamTrackId(src)` (the id inside `/api/stream/<id>`, null when
+  `src` is '') is the only honest answer; a track the element is not loaded with
+  passes `currentTime: 0`, so its own saved progress (or 0) decides. Row clicks
+  on the ALREADY-playing track must still keep its live position (verified).
 
 - For Git: only commit when user explicitly asks (follow Git Safety Protocol in tools).
 
@@ -288,11 +347,46 @@ absence → prune nothing, log only). T2 gained section 15 — the compiled
 `distributeGrabbyItems()` driven against a scratch DB, 122 assertions — because
 the pure planner tests cannot see timestamps or bag state. The frontend
 playback liveness watchdog (`stall-guard.ts` + `_runStallCheck()`, T4 =
-`node tests/stall-guard.test.mjs`, 45 assertions) is now in the DEPLOYED
+`node tests/stall-guard.test.mjs`, 53 assertions) is now in the DEPLOYED
 bundle: 20 s of no `timeupdate` progress on a "playing" element →
 `⏳ Buffering…/Reconnecting…` badge + same-track reload over a NEW request,
 resumed at `stallResumeTarget()`, skip after 3 attempts. E2E-proven against a
 real wedged media socket: old bundle froze at 29.4 s with zero requests and no
 badge, new bundle recovered in ~12 s and continued from 29.4 s with no replay.
 T1's `hostPath()` translation of stored `/cache/...` audioPaths fixed 3
-false-failure groups.)
+false-failure groups.
+Last updated: 2026-11-15 (the next track no longer starts where the previous
+one stopped. `loadAndSeekVideo` decided "same track" from `currentVideo`, which
+`_tryPlay` had ALREADY overwritten with the candidate while the element still
+held the finished track — so every advance seeked the next track to the
+finished one's `currentTime`, and any next track longer than the position being
+left began partway through itself (`Resumed cm7i62EE7T8 from 105.9s` after a
+1:46 item; 80 s after a mid-track row click). Same-track identity now comes
+from `stall-guard.streamTrackId(audio.src)`, so a different track passes
+`currentTime: 0` and resumes at its own saved progress or 0, and gets a fresh
+watchdog budget. T4 gained the ownership cases (8 assertions); T5 documents the
+paired before/after headless-Chromium recipe. Verified in two real browser tabs
+serving the pre-fix and post-fix bundles side by side, then deployed via
+`docker compose up -d --build` — the deployed bundle is `main-EPSOMVDU.js` and
+T1 still PASSes.)
+Last updated (same day, second fix): the shared `cache/` dir had **no ownership
+test** — GrabbyTube's index was a bare sweep keyed on "the sidecar has a
+`videoId` key", which DrivePod's own sidecar also has, so 1,340 of its 2,057
+"tracks" were DrivePod videos and 464 had already been converted to
+`isGrabby:true` by reconditioning (watched/progress reset, real upload date
+replaced by a band draw so auto-purge never reached them, artist replaced by a
+placeholder channel). Ownership is now GrabbyTube's `createdAt` marker
+(`isGrabbyAuthored` / `sidecarIsGrabbyAuthored`) and is consulted at EVERY
+decision: GrabbyTube's index rebuild (2,057 → 717 entries), DrivePod's bag seed,
+the cleanup orphan rule (which reclaimed 11 DrivePod folders / 1.1 GB instead of
+skipping everything that looked grabby), the distribute candidate filter (a
+`isGrabby:false` row is refused twice — filter time and placement time — and its
+bag entry rotates back un-used), the startup `revertForeignGrabbyRows()` (runs
+FIRST, before the bag seed / artist backfill / first harvest; restores
+`publishedAt` + `channelId` from the sidecar, recreates a deleted channel
+INACTIVE, never touches watched/progress/ignored/protected; no sidecar ⇒ stays
+grabby) and T1 A14/A14b, which now FAIL on an unmarked grabby row or a grabby
+row the authored index dropped. T2 gained section 16 (17 assertions over the real
+compiled `initShuffleBag`/`distributeGrabbyItems`/`revertForeignGrabbyRows`;
+suite total 139). Deployed: both containers rebuilt + recreated, 464 rows back to
+normal (690 watched again, 1,114 normal + 388 grabby in the index), T1 PASS.

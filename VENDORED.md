@@ -14,10 +14,10 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 
 ## Pin
 
-| Tree | Upstream | SHA (2026-11-14) | Patched files |
+| Tree | Upstream | SHA | Patched files |
 |---|---|---|---|
-| `stack/drivepod/` | `fartwhif/DrivePod` | `c4fb0416820bdaa368b570e90b730b10528dd86b` | 2 |
-| `stack/grabbytube/` | `fartwhif/GrabbyTube` | `97d58a8bc7d2651d5a96984971a5c95f08b00623` | 8 |
+| `stack/drivepod/` | `fartwhif/DrivePod` | `1deb2bbaa13d56b57ff0382c2242175e25c4467c` (2026-11-15) | 2 |
+| `stack/grabbytube/` | `fartwhif/GrabbyTube` | `6d636e06736304a452ca901451849e2618fb1b9f` (2026-11-15) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `92bcc1f41c559f3498c30a51cd36013d9b5902e0` | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
 | `stack/vault/` | `fartwhif/ytcookies` | `8c3d0903b58f1576e349ff2b6c8d97d688a61851` | 1 |
@@ -40,30 +40,74 @@ moves the real state to `/data`, where the hub keeps it.
 
 ---
 
-## `stack/drivepod/` — DrivePod @ c4fb041
+## `stack/drivepod/` — DrivePod @ 1deb2bb
 
-`backend/src/server.ts` (9 hunks)
+`backend/src/server.ts` (11 hunks)
 
 | Anchor | Patch | Gate |
 |---|---|---|
 | `const port` / `app.listen` | `PORT` and `HOST` are read from the environment (`3000`/`0.0.0.0` defaults); the hub supervises one backend per partition on its own loopback port | unset ⇒ today |
 | top of `app` setup | `URL_PREFIX = HUB_URL_PREFIX` registers ONE middleware that peels the mount off `req.url` (routes stay declared bare; `req.originalUrl` keeps what the client asked for). `MEDIA_PREFIX` = `/cache` or `<prefix>/cache`. `GRABBY_API_URL` replaces the hardcoded `http://grabbytube:8101` | `HUB_URL_PREFIX` unset ⇒ no middleware, plain `/cache` |
-| `updateIndexFile()` | returns the `ProgressEntry[]` it just wrote (`null` on failure) so a caller can mirror it; `audioPath`/`thumbnailPath` in **index.json only** get `MEDIA_PREFIX` (DB rows and per-item JSON keep bare filesystem paths, and the guard accepts both forms so nothing is mounted twice) | `MEDIA_PREFIX` = `/cache` ⇒ byte-identical output |
+| `updateIndexFile()` | returns the `ProgressEntry[]` it just wrote (`null` on failure) so a caller can mirror it; `audioPath`/`thumbnailPath` in **index.json only** get `MEDIA_PREFIX` (DB rows and per-item JSON keep bare filesystem paths, and the guard accepts both forms so nothing is mounted twice). Upstream's `revertForeignGrabbyRows()` also calls it — the revert needs no change, and its rewrite of index.json comes out prefixed exactly like every other writer's | `MEDIA_PREFIX` = `/cache` ⇒ byte-identical output |
 | `MEMBER_USER_RE` + `writeMemberProgress()` | mirrors the progress list into `progress-<X-User>.json`, the file the gateway's `cache/progress.json` alias serves, so two members of one partition (or one user's phone and car) never overwrite each other's resume point. Name must match `hubdb`'s shape or the mirror is skipped | no `X-User` header ⇒ no extra file |
 | `POST …/watched` | passes the freshly derived list to `writeMemberProgress(req.headers['x-user'], …)`; a failed regeneration leaves both files alone | |
 | remote delete (`resolveGrabbyAudioPath` owner) | `DELETE` goes to `GRABBY_API_URL` and carries `X-Partition-Slug` (only when `HUB_SLUG` is set — an empty header value is a different request than none) plus `X-User` when the gate named one | unset ⇒ today's URL, today's headers |
 | harvest `cmd` | yt-dlp executable from `DRIVEPOD_YTDLP`; PO-token sidecar from `DRIVEPOD_BGUTIL_URL` | both default to today's values |
+| `writeTempCookiesFile()` / `deleteTempCookiesFile()` | `COOKIES_FILE` set ⇒ this partition's vault OWNS that path, so a harvest neither unlinks it at start/finish (that threw away the vault's export in the first round and left every later yt-dlp run cookieless, which is what the bot check then punished) nor overwrites it from an uploaded cookie file | `COOKIES_FILE` unset ⇒ both helpers byte-identical |
+
+Carried along byte-identical from upstream (no listen patch):
+`frontend/src/app/stall-guard.ts` (now exports `streamTrackId`),
+`tests/stall-guard.test.mjs` (T4, 53 assertions),
+`tests/pure-logic.test.mjs` (T2 §16 drives the new
+`revertForeignGrabbyRows`/`initShuffleBag`/`distributeGrabbyItems` exports),
+`tests/content-audit.mjs` (A14/A14b became hard failures — it keys orphan and
+grabby-label checks on the `createdAt` marker), `AGENTS.md`, `ARCHITECTURE.md`.
+
+**Upstream 1deb2bb is the authorship-marker fix, and it changes what the hub's
+`/data` looks like on first start.** Ownership of a `cache/<id>/` folder is now
+GrabbyTube's sidecar `createdAt` (`isGrabbyAuthored` /
+`sidecarIsGrabbyAuthored`), never "a sidecar has a `videoId`" (DrivePod's own
+writers emit that key too) and never "the index lists it". Consequences:
+`loadGrabbyIndex()` drops unmarked entries and logs the count; the cleanup
+orphan/corrupt rules protect a folder only when the marker agrees with the DB
+label; `initShuffleBag` (now exported) seeds from the filtered index;
+`distributeGrabbyItems` refuses to convert an `isGrabby:false` row twice (the
+planner spends no slot on it, and a row inserted between filter and placement
+is refused again); and `revertForeignGrabbyRows()` runs FIRST at startup —
+before the bag seed, the artist backfill and the first harvest — restoring
+`publishedAt`/`channelId` from the sidecar and recreating a deleted channel
+INACTIVE. For a migrated hub that means: rows the old bare sweep flipped to
+`isGrabby` come back to the normal queue on the first start (watched,
+progress, ignored and protected untouched; no sidecar ⇒ stays grabby), while
+`grabby-index.json` itself keeps its foreign entries until some GrabbyTube
+event rebuilds it (download, delete, meta edit or a tunester run) — harmless,
+because every DrivePod reader filters on the marker, and the entry simply
+stops being offered to the bag until then. Nothing outside this tree has to
+change for that.
 
 `frontend/src/app/app.component.ts` (9 hunks)
 
 `mountBase(baseURI)` derives the mount from `<base href>` (empty at `/`), so ONE
 hashed bundle serves the portal root and every `/l/<slug>/` shell. `apiUrl` and
-the `/api/stream/…` sites (play, HEAD probes, retries, mediaSession artwork) are
-built from it. `index.json`/`progress.json` are fetched as
-`${MOUNT}/cache/…`. No build-time prefix: the gateway writes the per-partition
-shell (`platform/gen-conf.py`).
+the `/api/stream/…` sites (play, HEAD probes, retries) are built from it.
+`index.json`/`progress.json` are fetched as `${MOUNT}/cache/…`. No build-time
+prefix: the gateway writes the per-partition shell (`platform/gen-conf.py`).
 
-## `stack/grabbytube/` — GrabbyTube @ 97d58a8
+1deb2bb moved the "is this the same track?" decision into
+`stall-guard.streamTrackId(audio.src)` (`/\/api\/stream\/([A-Za-z0-9_-]+)/`) —
+the one place a mount prefix could have broken track identity, and it does not:
+the src this file assigns is `${MOUNT}/api/stream/<id>`, and the regex reads the
+`/api/stream/<id>` tail, so it matches at the portal root (`/api/stream/x`) and
+under a mount (`/l/family/api/stream/x`) alike. That holds only while the
+gateway leaves the tail intact, which it does — `location /l/<slug>/api/`
+proxies with no rewrite (only the tuner's `/l/<slug>/api/` rewrites, and that is
+tunester, never the stream) and the front partition's bare aliases forward
+`/api/stream/…` unchanged. T4's `streamTrackId` cases prove both shapes
+(`node tests/stall-guard.test.mjs`, now 53 assertions). mediaSession artwork
+still uses `video.thumbnailPath` exactly as index.json carries it — prefixed by
+the backend, so nothing here needed a change.
+
+## `stack/grabbytube/` — GrabbyTube @ 6d636e0
 
 | File | Patch | Gate |
 |---|---|---|
@@ -73,7 +117,7 @@ shell (`platform/gen-conf.py`).
 | `api/routes.py` | `GET/POST /settings/yt-dlp` read/write `settings.ytdlp` and `settings.bgutil_url` instead of hardcoded text, persisted through the existing `set_config` store | |
 | `processor.py` | `_COOKIES_FILE` is the env-named partition file (upload/delete write a real partition path); `effective_cookies_file()` offers `[settings.cookies_file] + (shared, local)` with the same exists-and-non-empty skip, so a fresh partition with no export still passes no `--cookies`; bgutil `base_url` and both `["yt-dlp"]` argv heads come from settings; **`_write_mp3_tags` copy-on-write** — when a partition slug is set and the file has `st_nlink > 1`, copy + `os.replace` gives this copy a private inode before mutagen saves, because mutagen writes through the fd and retitling a blob link would rewrite the shared `/data/pool/blobs/<sha256>.mp3` and leave its hash-name describing the wrong bytes | slug unset ⇒ no `stat()`, in-place save as today |
 | `processor.py` (worker) | real concurrency cap: upstream `await`ed one job before taking the next, so `settings.max_concurrent` could never exceed 1 and `quota.concurrentDownloads` was decorative. The hub loop claims jobs into `asyncio.create_task` up to `max_concurrent`, reaps with `asyncio.wait(FIRST_COMPLETED)`, and calls `reclaim_stale_jobs()` at start. Proven per partition: the quota-1 test partition's second job stayed `queued` until the first harvest ended, while a quota-2 partition ran two 6 s harvests in exact overlap | standalone: `max_concurrent`'s default 2 now genuinely means 2 |
-| `processor.py` (index) | `audioPath`/`thumbnailPath` stay **relative and unprefixed**: DrivePod resolves them against its own `CACHE_DIR`, and this app's UI sits under its own mount where a relative path already lands right | — |
+| `processor.py` (index) | `audioPath`/`thumbnailPath` stay **relative and unprefixed**: DrivePod resolves them against its own `CACHE_DIR` (`resolveGrabbyAudioPath`), and this app's UI sits under its own mount where a relative path already lands right. 6d636e0 rewrote this same file's `update_index_file()` so the index lists **only what this app authored** — an item JSON with a non-empty `createdAt` AND a catalog record (via `load_catalog()`, imported here already) — counting foreign folders and WARNing on `createdAt`-without-catalog, so an index entry is now an ownership statement, which is what DrivePod's `isGrabbyAuthored` filter reads. Output dir (`GRABBY_OUTPUT_DIR`) and catalog (`GRABBY_CATALOG_PATH`) still come from `config.py` settings, so a sweep sees only this tenant's cache | — |
 | `tunester.py` | `_slug_header()` sends `X-Partition-Slug` on `POST /api/tune`, `GET /api/job/<id>`, `GET /api/dl/<jid>`, `POST /api/clear`; `_hardlink_delivery()` uses `os.link` + `os.replace` when the download response carries `X-Pool-Path` (see `platform/poolimport.py`), else today's streamed write | header absent ⇒ no header; no `X-Pool-Path` ⇒ streamed bytes |
 | `static/index.html`, `static/js/app.js` | `API` derived from `document.baseURI` (empty standalone, `/l/<slug>/grabby` under the gateway); shell refs made relative | |
 
