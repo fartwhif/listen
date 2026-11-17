@@ -16,7 +16,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 
 | Tree | Upstream | SHA | Patched files |
 |---|---|---|---|
-| `stack/drivepod/` | `fartwhif/DrivePod` | `23b03a9caf34d0572e42a39d56ca661474cb58f5` (2026-11-16) | 2 |
+| `stack/drivepod/` | `fartwhif/DrivePod` | `aa6554771af640f9aade2db9ce4f028700b3def6` (2026-11-17) | 2 |
 | `stack/grabbytube/` | `fartwhif/GrabbyTube` | `6d636e06736304a452ca901451849e2618fb1b9f` (2026-11-15) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `92bcc1f41c559f3498c30a51cd36013d9b5902e0` | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
@@ -40,7 +40,31 @@ moves the real state to `/data`, where the hub keeps it.
 
 ---
 
-## `stack/drivepod/` — DrivePod @ 23b03a9
+## `stack/drivepod/` — DrivePod @ aa65547
+
+> **2026-11-17 re-vendor (23b03a9 → aa65547).** Two upstream commits.
+> `d3f39d5` is the owner's three reported symptoms: `folderCorruptionReason()`
+> judges a cache folder by EXACT file names (FrogRock's `<id>.mp3.tr64k.mp3`
+> radio transcode and GrabbyTube's `<id>.mp3.bak` are no longer "Multiple .mp3
+> files" that get a healthy grabby row — and its watched/progress state —
+> deleted), `DELETE /api/video/:id/grabby` decides library-track-ness from the
+> sidecar `createdAt` marker instead of the DB row (a row already gone is a
+> landing consume, not a 404 the Delete key alerts on), and
+> `frontend/src/app/autoplay-order.ts`'s pure `pickNextTrack(queue, mode,
+> finished?)` is now the one pick behind EVERY advance — page-load autoplay,
+> defunct skip, unplayable give-up, post-refresh fallback, the manual ⏭️
+> (`manualNextMode`: `off` → `older`) and `consumedGrabbyTrack()` — with the ⏮️
+> button and the `previoustrack` handler removed. `aa65547` is the matching
+> `AGENTS.md`/`ARCHITECTURE.md`. Upstream's new lines and the hub patches again
+> touched **disjoint** regions, so this re-copy is a clean 3-way merge
+> (`git merge-file`, 0 conflicts): the patch set below is byte-unchanged and no
+> env gate was introduced or changed. The frontend gains a file
+> (`autoplay-order.ts`, imported by `app.component.ts`, never touches a URL so
+> there is no mount concern) and T6 (`tests/autoplay-order.test.mjs`), both
+> carried byte-identical; `tests/run-scratch.sh` gained
+> `--add-host grabbytube:127.0.0.1` because T2 §18 drives the consume route
+> against a stubbed grabbytube on that hostname. Deployed bundle:
+> `main-J5K7G6VO.js` (`APP_VERSION 1.14.0`).
 
 > **2026-11-16 re-vendor (1db5b42 → 23b03a9).** Upstream changed the grabby
 > shufflebag (played tracks now leave the bag: `initShuffleBag` set-asides
@@ -50,10 +74,8 @@ moves the real state to `/data`, where the hub keeps it.
 > `_playFreshest` that re-fetches `index.json` before picking — it reuses the
 > existing `fetchIndexWithProgress()` helper, so it inherits this tree's
 > `${MOUNT}/cache/…` patch for free). Upstream's new lines and the eleven hub
-> patches touched **disjoint** regions of both patched files, so this re-copy
-> was a clean 3-way merge (`git merge-file`, 0 conflicts): the patch set below
-> is byte-unchanged, and every added line is upstream's, not a new patch. No
-> env gate was introduced or changed.
+> patches touched **disjoint** regions of both patched files, so that re-copy
+> was a clean 3-way merge too.
 
 `backend/src/server.ts` (11 hunks)
 
@@ -69,12 +91,13 @@ moves the real state to `/data`, where the hub keeps it.
 | `writeTempCookiesFile()` / `deleteTempCookiesFile()` | `COOKIES_FILE` set ⇒ this partition's vault OWNS that path, so a harvest neither unlinks it at start/finish (that threw away the vault's export in the first round and left every later yt-dlp run cookieless, which is what the bot check then punished) nor overwrites it from an uploaded cookie file | `COOKIES_FILE` unset ⇒ both helpers byte-identical |
 
 Carried along byte-identical from upstream (no listen patch):
-`frontend/src/app/stall-guard.ts` (now exports `streamTrackId`),
-`tests/stall-guard.test.mjs` (T4, 53 assertions),
-`tests/pure-logic.test.mjs` (T2 §16 drives the new
-`revertForeignGrabbyRows`/`initShuffleBag`/`distributeGrabbyItems` exports),
-`tests/content-audit.mjs` (A14/A14b became hard failures — it keys orphan and
-grabby-label checks on the `createdAt` marker), `AGENTS.md`, `ARCHITECTURE.md`.
+`frontend/src/app/autoplay-order.ts` (the pure advance pick, imported by
+`app.component.ts`), `frontend/src/app/stall-guard.ts` (exports `streamTrackId`),
+`tests/autoplay-order.test.mjs` (T6), `tests/stall-guard.test.mjs` (T4, 53
+assertions), `tests/pure-logic.test.mjs` (T2 §16-§18: the authorship marker, the
+`folderCorruptionReason` verdict, the consume route), `tests/content-audit.mjs`
+(A14/A14b key orphan and grabby-label checks on the `createdAt` marker),
+`AGENTS.md`, `ARCHITECTURE.md`.
 
 **Upstream 1db5b42 is the authorship-marker fix, and it changes what the hub's
 `/data` looks like on first start.** Ownership of a `cache/<id>/` folder is now
