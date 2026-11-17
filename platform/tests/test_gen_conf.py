@@ -229,7 +229,10 @@ def test_supervisor_conf_programs_per_partition(two):
         "bgutil", "hubauth", "nginx", "streamfix", "tunester", "watchdog",
         "drivepod-owner", "grabbytube-owner", "frogrock-owner",
         "drivepod-family", "grabbytube-family", "frogrock-family",
-        "vault-owner"])
+        # one TRANSPORT (vnc-<vault>, always-on websockify) plus one BROWSER
+        # (vault-<vault>, demand chromium) per distinct vault id - here both
+        # partitions name vault "owner", so one of each.
+        "vnc-owner", "vault-owner"])
     # radio False must remove the broadcaster, not just its port.
     two["partitions"]["family"]["radio"] = False
     assert "frogrock-family" not in program_blocks(gen.supervisor_conf(two))
@@ -248,15 +251,27 @@ def test_vault_programs_are_manual_start(two):
     # Named after the VAULT, and one per distinct vault: the program drives one
     # Google account's browser, so two partitions sharing vault "owner" get one
     # program between them (see test_vault_programs_are_named_after_the_vault).
-    for vault in gen.vault_hosts(two):
+    for vault, host in gen.vault_hosts(two).items():
         b = blocks[f"vault-{vault}"]
         # autostart/autorestart false is the owner's invariant: no chromium
         # until a session is actually stale. The watchdog owns the life.
         assert "autostart=false" in b and "autorestart=false" in b
         # The host partition is the argument: vault-run.py derives the profile
         # dir and the fan-out targets from it, and only the host has a browser.
-        assert f"python3 /srv/stack/platform/vault-run.py {vault}" in b
+        assert f"python3 /srv/stack/platform/vault-run.py {host}" in b
         assert f"stdout_logfile=/var/log/sup/vault-{vault}.log" in b
+        # The TRANSPORT that wakes it is the opposite policy: always up, so the
+        # noVNC door answers whether or not a browser exists. autorestart true
+        # is the whole point - a websockify that dies comes back, and the door
+        # stops saying "connection is closed". It runs vnc-run.py with the HOST
+        # slug and starts before the demand browser (lower priority number).
+        t = blocks[f"vnc-{vault}"]
+        assert "autostart=true" in t and "autorestart=true" in t
+        assert f"python3 /srv/stack/platform/vnc-run.py {host}" in t
+        assert f"stdout_logfile=/var/log/sup/vnc-{vault}.log" in t
+        prio_t = int(re.search(r"priority=(\d+)", t).group(1))
+        prio_b = int(re.search(r"priority=(\d+)", b).group(1))
+        assert prio_t < prio_b
     assert "autostart=true" in blocks["drivepod-owner"]
     # QUIT, not TERM: a graceful nginx drains the listeners mid-stream.
     assert "stopsignal=QUIT" in blocks["nginx"]
@@ -467,6 +482,66 @@ def test_two_accounts_get_two_vault_programs(two):
         assert e["VAULT_PROFILE_DIR"] == \
             f"{gen.DATA}/vaults/{e['VAULT_SLUG']}/profiles/{slug}"
     assert gen.vault_hosts(reg) == {"owner": "owner", "kidacct": "family"}
+
+
+def test_the_vnc_transport_env_is_minimal_per_vault(two, monkeypatch):
+    """The transport daemon (vnc-<vault>) holds X + websockify up and wakes the
+    browser; it never opens a cookie or authenticates Google. So its env is the
+    per-vault browser ports and the door password - nothing else. Two mistakes
+    this pins, both silent at runtime:
+
+      * leaking a tenant path / credential into it (COOKIES_FILE, the Google
+        pair, the fan-out lists, VNC_URL) would let a transport bug read or write
+        a session it was never meant to touch - exactly the "two browsers rotate
+        one jar" bug the dedup removed, moved into the daemon;
+      * a member-hosted vault would, with one shared env, wake the wrong
+        browser: so each transport carries its OWN vault id and its own ports.
+
+    VNC_PASSWORD / HUB_SUP_SOCK / VNC_RESOLUTION come from the container env
+    (passthrough), so they are delenv'd to test the floor, then set to test the
+    only growth these three names can ever cause.
+    """
+    for n in ("VNC_PASSWORD", "HUB_SUP_SOCK", "VNC_RESOLUTION"):
+        monkeypatch.delenv(n, raising=False)
+    blocks = program_blocks(gen.supervisor_conf(two))
+    e = env_of(blocks["vnc-owner"])
+    # The floor: identity + the ports the daemon dials, and NOTHING a cookie
+    # or a sign-in would need.
+    assert set(e) == {"HUB_SLUG", "VAULT_SLUG", "VNC_DISPLAY",
+                      "VNC_PORT", "WEBSOCKIFY_PORT"}
+    p = gen.ports(two["partitions"]["owner"]["index"])
+    assert e["VNC_PORT"] == str(p["vnc"]) and e["WEBSOCKIFY_PORT"] == str(p["ws"])
+    assert e["HUB_SLUG"] == "owner" and e["VAULT_SLUG"] == "owner"
+    for banned in ("COOKIES_FILE", "VAULT_PROFILE_DIR", "VAULT_DIR", "HOME",
+                   "COOKIE_FANOUT_FILES", "COOKIE_SESSION_STATE_FANOUT",
+                   "DRIVEPOD_PUSH_URLS", "GRABBY_PUSH_URLS", "VNC_URL",
+                   "GOOGLE_EMAIL", "GOOGLE_PASSWORD", "CDP_PORT", "VNC_WS_URL",
+                   "VNC_DRIVER_URL", "DATABASE_URL", "GRABBY_DB_PATH"):
+        assert banned not in e, banned
+    # The only growth those three names ever cause, with the browser's env
+    # unchanged apart from its own VAULT_PROFILE_DIR (which the transport lacks).
+    monkeypatch.setenv("VNC_PASSWORD", "s3cret")
+    monkeypatch.setenv("HUB_SUP_SOCK", "/run/sup.sock")
+    blocks = program_blocks(gen.supervisor_conf(two))
+    e2 = env_of(blocks["vnc-owner"])
+    assert e2["VNC_PASSWORD"] == "s3cret" and e2["HUB_SUP_SOCK"] == "/run/sup.sock"
+    assert set(e2) - {"VNC_PASSWORD", "HUB_SUP_SOCK"} == set(e)
+    # Two accounts: each transport dials its OWN vault id + ports, so a member
+    # wakes the browser that owns its profile, not the host's.
+    reg = json.loads(json.dumps(two))
+    reg["partitions"]["family"]["vault"] = "kidacct"
+    reg = _with_index(reg)
+    blocks = program_blocks(gen.supervisor_conf(reg))
+    assert sorted(n for n in blocks if n.startswith("vnc-")) == \
+        ["vnc-kidacct", "vnc-owner"]
+    for name, slug in (("vnc-owner", "owner"), ("vnc-kidacct", "family")):
+        e = env_of(blocks[name])
+        p = gen.ports(reg["partitions"][slug]["index"])
+        assert e["HUB_SLUG"] == slug
+        assert e["VAULT_SLUG"] == reg["partitions"][slug]["vault_slug"]
+        assert e["VNC_PORT"] == str(p["vnc"])
+        assert e["WEBSOCKIFY_PORT"] == str(p["ws"])
+        assert e["VNC_DISPLAY"] == str(10 + reg["partitions"][slug]["index"])
 
 
 def test_two_accounts_get_their_own_credentials(two, monkeypatch):

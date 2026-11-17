@@ -414,6 +414,25 @@ def vault_env(slug: str, spec: dict, reg: dict) -> str:
     return env_str(merged)
 
 
+def transport_env(slug: str, spec: dict) -> str:
+    """An always-on vault TRANSPORT (Xvfb, x11vnc, websockify - the thing the
+    noVNC door connects to) needs only the per-vault browser ports and the door
+    password: it holds the display and the websocket port up, and names the
+    browser it wakes (`vault-<VAULT_SLUG>`). It gets none of the tenant paths,
+    Google credentials or fan-out targets - it never touches a cookie, only X -
+    so those stay in vault_env (the browser's env). VNC_RESOLUTION may come from
+    either the host partition's `settings` (tenant_vals) or the container's own
+    environment (passthrough); the password and the supervisor socket only ever
+    from the container, which is where they live.
+    """
+    t = tenant_vals(slug, spec)
+    vals = {k: t[k] for k in ("HUB_SLUG", "VAULT_SLUG", "VNC_DISPLAY",
+                              "VNC_PORT", "WEBSOCKIFY_PORT", "VNC_RESOLUTION")
+            if k in t}
+    vals.update(passthrough(("VNC_PASSWORD", "HUB_SUP_SOCK")))
+    return env_str(vals)
+
+
 def vnc_door(slug: str) -> str:
     """The backstop door's public URL, so the exporter's session-death message
     can point a human at the browser instead of hardcoding a hostname in
@@ -532,10 +551,14 @@ def supervisor_conf(reg: dict) -> str:
                        PRIO_PROXY, 3, 25, stopsignal="QUIT"))
 
     # ---- vaults ------------------------------------------------------
-    # autostart/autorestart false: the whole point is that no browser runs
-    # until a session is actually stale (the owner's invariant, enforced by
-    # construction). The watchdog starts and stops these; so does
-    # `hub vault start|stop`.
+    # Two programs per vault (below): an always-on TRANSPORT (vnc-<vault>,
+    # autostart/autorestart true) that holds the noVNC door's port up and wakes
+    # the browser the moment a human connects, and the demand BROWSER
+    # (vault-<vault>, autostart/autorestart false), whose whole point is that no
+    # chromium runs until a sign-in is stale or a human opens the door (the
+    # owner's invariant, enforced by construction). The browser is started by the
+    # watchdog (stale session), by the transport (a door connection), and by
+    # `hub vault start|stop`; the transport is supervised automatically.
     #
     # ONE program per distinct vault id (vault_hosts), named after the VAULT, not
     # the partition: the vault id is the Google account, and starting one family
@@ -544,6 +567,13 @@ def supervisor_conf(reg: dict) -> str:
     # browser ports, profile dir and jar are that partition's; members get their
     # jar by fan-out and their door by proxy (see _locations).
     for vault, host in vault_hosts(reg).items():
+        # The transport first (priority below the browser) so the door is
+        # listening before anything can wake a browser into it.
+        out.append(program(
+            f"vnc-{vault}",
+            f"python3 {STACK}/platform/vnc-run.py {host}",
+            f"{STACK}/platform", transport_env(host, reg["partitions"][host]),
+            38, 5, 20))
         out.append(program(
             f"vault-{vault}",
             f"python3 {STACK}/platform/vault-run.py {host}",

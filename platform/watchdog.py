@@ -51,6 +51,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 gen_conf = importlib.import_module("gen-conf")
+family = importlib.import_module("family")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("HUB_DATA_DIR", "/data")
@@ -207,10 +208,22 @@ def scan_vaults(reg: dict, now: float, attempts: dict[str, Attempt]) -> None:
         if running:
             st.running = True
             if state == "RUNNING" and live and uptime > IDLE:
-                log(f"{name}: {why} (host {host}) but the family has been up "
-                    f"{int(uptime)}s > idle {IDLE}s; stopping it "
-                    f"(vault-run did not exit)")
-                ctl("stop", name)
+                ws = gen_conf.ports(reg["partitions"][host]["index"])["ws"]
+                clients = family.door_clients(ws)
+                if clients:
+                    # A human at the door outranks the idle backstop: the whole
+                    # reason vault-run did not exit is that it is staying for
+                    # them, and stopping it would cut a live watch off. The
+                    # count is the gateway's sockets only, so a phantom tab (no
+                    # ESTABLISHED conn) does not pin the family open.
+                    log(f"{name}: up {int(uptime)}s > idle {IDLE}s but "
+                        f"{clients} noVNC client(s) at the door; NOT stopping "
+                        f"(a human is watching)")
+                else:
+                    log(f"{name}: {why} (host {host}) but the family has been "
+                        f"up {int(uptime)}s > idle {IDLE}s; stopping it "
+                        f"(vault-run did not exit)")
+                    ctl("stop", name)
             continue
 
         if st.running:

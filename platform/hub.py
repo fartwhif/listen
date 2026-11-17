@@ -407,6 +407,13 @@ def cmd_vault(a) -> int:
     members = [s for s in reg.get("slugs", [])
                if vault_of(reg, s)[0] == vault]
     if a.action == "status":
+        # Both halves of the vault: the always-on transport (vnc-<vault>) is what
+        # makes the noVNC door answer, the demand browser (vault-<vault>) is what
+        # signs the account in. A door that says "connection is closed" is the
+        # transport, and an operator looking at `vault status` has to see it.
+        print(f"-- transport (vnc-{vault}: noVNC door) --")
+        ctl("status", f"vnc-{vault}")
+        print(f"-- browser (vault-{vault}: sign-in) --")
         rc = ctl("status", name)
         _vault_note(vault, host, members)
         return rc

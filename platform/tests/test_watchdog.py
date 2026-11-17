@@ -144,6 +144,35 @@ def test_an_idle_stop_targets_the_vault_program_not_every_partition(shared,
     assert attempts["owner"].running is True
 
 
+def test_a_human_at_the_door_outranks_the_idle_stop(shared, monkeypatch):
+    """The reason vault-run did not exit at idle can be that it is STAYING for a
+    human watching the sign-in, not that it is wedged. Cutting that watch off is
+    worse than the backstop it replaces, so a live door client outranks the stop.
+
+    The count is every established door-port leg minus the family's own sockets
+    (family.door_clients): a phantom tab with no connection, and the keyboard
+    driver's direct websockify socket, are NOT humans, so they fall through.
+    """
+    now = time.time()
+    live_session(shared["data"], "owner", now)
+    ctl = FakeCtl()
+    monkeypatch.setattr(wd, "ctl", ctl)
+    def state(name):
+        return ("RUNNING", wd.IDLE + 60) if name == "vault-owner" \
+            else ("STOPPED", 0.0)
+    monkeypatch.setattr(wd, "program_state", state)
+    monkeypatch.setattr(wd.family, "door_clients", lambda ws: 1)
+    seen: list[str] = []
+    monkeypatch.setattr(wd, "log", seen.append)
+    attempts: dict = {}
+    wd.scan_vaults(shared["reg"], now, attempts)
+    assert ctl.verbs("vault-owner") == []           # NOT stopped, a human is here
+    assert attempts["owner"].running is True
+    assert any("NOT stopping" in m and "noVNC client" in m for m in seen), seen
+
+
+
+
 def test_a_shared_vault_counts_ONE_attempt_per_scan(shared, monkeypatch):
     """The failure counter drives exponential backoff, so it must advance once
     per ATTEMPT, not once per partition that happens to name the vault: two
