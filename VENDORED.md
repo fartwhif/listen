@@ -16,7 +16,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 
 | Tree | Upstream | SHA | Patched files |
 |---|---|---|---|
-| `stack/drivepod/` | `fartwhif/DrivePod` | `b896cc694956044158afe8c84e6d47dc3ca174a2` (2026-11-17) | 2 |
+| `stack/drivepod/` | `fartwhif/DrivePod` | `00f68c4d201b1af612fd30b113b457b8fb605233` (2026-11-17) | 2 |
 | `stack/grabbytube/` | `fartwhif/GrabbyTube` | `6d636e06736304a452ca901451849e2618fb1b9f` (2026-11-15) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `92bcc1f41c559f3498c30a51cd36013d9b5902e0` | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
@@ -40,10 +40,10 @@ moves the real state to `/data`, where the hub keeps it.
 
 ---
 
-## `stack/drivepod/` — DrivePod @ b896cc6
+## `stack/drivepod/` — DrivePod @ 00f68c4
 
-> **2026-11-17 re-vendor (ca04586 → b896cc6).** One upstream commit, the fourth
-> round of the owner's report: `onerror` decided a media error's owner from
+> **2026-11-17 re-vendor (ca04586 → 00f68c4).** One upstream commit, the follow-up
+> round on the owner's report: `onerror` decided a media error's owner from
 > `audio.src`, which a new assignment had already retargeted, so an aborted load
 > charged the healthy track a press had just selected — two such charges hit
 > `MAX_TRACK_PLAY_FAILURES` and marked watched a file nobody had heard. Upstream
@@ -62,6 +62,14 @@ moves the real state to `/data`, where the hub keeps it.
 > gate was added. Deployed bundle: `main-FET5B5YG.js` (`APP_VERSION 1.16.0`,
 > built by the `frontend-builder` stage from THIS tree; the bare upstream tree
 > builds `main-BYLUDOPH.js`).
+> The pin moved with a same-day DrivePod history rewrite: a real deployment
+> hostname had been added as a fixture literal in
+> `tests/stall-guard.test.mjs` (it survived the 2026-11-16 sweep because that
+> file was new that day), and the rewrite replaced it with `example.com` per the
+> placeholder convention. The pre-scrub tip `b896cc6` is dead upstream, `00f68c4`
+> is its rewrite. Patch content and both built bundles are unchanged by it — the
+> rewrite touched only that one test-file blob, which no Dockerfile `COPY`
+> reaches.
 
 > **2026-11-17 re-vendor (bf1bf3a → ca04586).** One upstream commit: the owner
 > asked for the ⏮️ button back. `skipPrevious()` (button + `previoustrack`
