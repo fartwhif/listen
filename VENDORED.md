@@ -16,7 +16,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 
 | Tree | Upstream | SHA | Patched files |
 |---|---|---|---|
-| `stack/drivepod/` | `fartwhif/DrivePod` | `aa6554771af640f9aade2db9ce4f028700b3def6` (2026-11-17) | 2 |
+| `stack/drivepod/` | `fartwhif/DrivePod` | `bf1bf3ac78a9b0101800d5fe00f2574b78280c60` (2026-11-17) | 2 |
 | `stack/grabbytube/` | `fartwhif/GrabbyTube` | `6d636e06736304a452ca901451849e2618fb1b9f` (2026-11-15) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `92bcc1f41c559f3498c30a51cd36013d9b5902e0` | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
@@ -40,10 +40,13 @@ moves the real state to `/data`, where the hub keeps it.
 
 ---
 
-## `stack/drivepod/` — DrivePod @ aa65547
+## `stack/drivepod/` — DrivePod @ bf1bf3a
 
-> **2026-11-17 re-vendor (23b03a9 → aa65547).** Two upstream commits.
-> `d3f39d5` is the owner's three reported symptoms: `folderCorruptionReason()`
+> **2026-11-17 re-vendor (0642f8a → bf1bf3a).** Three upstream commits, on
+> history that was rewritten the same day (the hub-hostname scrub), so every
+> DrivePod SHA quoted here is post-rewrite — the `23b03a9` / `1db5b42` /
+> `1deb2bb` names this doc used before are gone upstream. `c610d0d` is the
+> owner's three reported symptoms: `folderCorruptionReason()`
 > judges a cache folder by EXACT file names (FrogRock's `<id>.mp3.tr64k.mp3`
 > radio transcode and GrabbyTube's `<id>.mp3.bak` are no longer "Multiple .mp3
 > files" that get a healthy grabby row — and its watched/progress state —
@@ -54,7 +57,7 @@ moves the real state to `/data`, where the hub keeps it.
 > finished?)` is now the one pick behind EVERY advance — page-load autoplay,
 > defunct skip, unplayable give-up, post-refresh fallback, the manual ⏭️
 > (`manualNextMode`: `off` → `older`) and `consumedGrabbyTrack()` — with the ⏮️
-> button and the `previoustrack` handler removed. `aa65547` is the matching
+> button and the `previoustrack` handler removed. `e1c7c6a` + `bf1bf3a` are the
 > `AGENTS.md`/`ARCHITECTURE.md`. Upstream's new lines and the hub patches again
 > touched **disjoint** regions, so this re-copy is a clean 3-way merge
 > (`git merge-file`, 0 conflicts): the patch set below is byte-unchanged and no
@@ -66,7 +69,7 @@ moves the real state to `/data`, where the hub keeps it.
 > against a stubbed grabbytube on that hostname. Deployed bundle:
 > `main-J5K7G6VO.js` (`APP_VERSION 1.14.0`).
 
-> **2026-11-16 re-vendor (1db5b42 → 23b03a9).** Upstream changed the grabby
+> **2026-11-16 re-vendor (c3a2b15 → 0642f8a).** Upstream changed the grabby
 > shufflebag (played tracks now leave the bag: `initShuffleBag` set-asides
 > watched rows, `reconcileShuffleBag` gained a third `pruneIds` argument,
 > `distributeGrabbyItems` skips played pulls, and the watched/unwatched routes
@@ -99,7 +102,7 @@ assertions), `tests/pure-logic.test.mjs` (T2 §16-§18: the authorship marker, t
 (A14/A14b key orphan and grabby-label checks on the `createdAt` marker),
 `AGENTS.md`, `ARCHITECTURE.md`.
 
-**Upstream 1db5b42 is the authorship-marker fix, and it changes what the hub's
+**Upstream c3a2b15 is the authorship-marker fix, and it changes what the hub's
 `/data` looks like on first start.** Ownership of a `cache/<id>/` folder is now
 GrabbyTube's sidecar `createdAt` (`isGrabbyAuthored` /
 `sidecarIsGrabbyAuthored`), never "a sidecar has a `videoId`" (DrivePod's own
@@ -129,7 +132,7 @@ the `/api/stream/…` sites (play, HEAD probes, retries) are built from it.
 `index.json`/`progress.json` are fetched as `${MOUNT}/cache/…`. No build-time
 prefix: the gateway writes the per-partition shell (`platform/gen-conf.py`).
 
-1db5b42 moved the "is this the same track?" decision into
+c3a2b15 moved the "is this the same track?" decision into
 `stall-guard.streamTrackId(audio.src)` (`/\/api\/stream\/([A-Za-z0-9_-]+)/`) —
 the one place a mount prefix could have broken track identity, and it does not:
 the src this file assigns is `${MOUNT}/api/stream/<id>`, and the regex reads the
