@@ -16,7 +16,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 
 | Tree | Upstream | SHA | Patched files |
 |---|---|---|---|
-| `stack/drivepod/` | `fartwhif/DrivePod` | `bf1bf3ac78a9b0101800d5fe00f2574b78280c60` (2026-11-17) | 2 |
+| `stack/drivepod/` | `fartwhif/DrivePod` | `b896cc694956044158afe8c84e6d47dc3ca174a2` (2026-11-17) | 2 |
 | `stack/grabbytube/` | `fartwhif/GrabbyTube` | `6d636e06736304a452ca901451849e2618fb1b9f` (2026-11-15) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `92bcc1f41c559f3498c30a51cd36013d9b5902e0` | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
@@ -40,7 +40,52 @@ moves the real state to `/data`, where the hub keeps it.
 
 ---
 
-## `stack/drivepod/` — DrivePod @ bf1bf3a
+## `stack/drivepod/` — DrivePod @ b896cc6
+
+> **2026-11-17 re-vendor (ca04586 → b896cc6).** One upstream commit, the fourth
+> round of the owner's report: `onerror` decided a media error's owner from
+> `audio.src`, which a new assignment had already retargeted, so an aborted load
+> charged the healthy track a press had just selected — two such charges hit
+> `MAX_TRACK_PLAY_FAILURES` and marked watched a file nobody had heard. Upstream
+> added `mediaEventTrackId` / `mediaErrorIsTrackDefect` /
+> `playRejectIsTrackDefect` to `stall-guard.ts` (byte-identical copy here) and
+> routed `onerror`, `onwaiting`, `onstalled` and `saveProgress` through that
+> ownership gate. The mount patch set is again **byte-unchanged** (9 hunks, same
+> 24 `>` and 9 `<` lines): the re-copy is a `git merge-file` with exactly ONE
+> conflict, in the play-reject final-probe block, where upstream added two lines
+> directly above the sixth `${this.apiUrl}/stream/…` HEAD probe — resolved by
+> keeping upstream's `playRejectIsTrackDefect(er?.name)` guard and this tree's
+> `apiUrl` URL. `app.component.html`, `autoplay-order.ts` and both new test files
+> are unaffected; `AGENTS.md` / `ARCHITECTURE.md` are byte-copies of upstream.
+> Only the hunk offsets move (new-side starts 96→99, 109→124, 571→589,
+> 1182→1230, 1514→1616, 1543→1645, 1578→1689, 1587→1699, 1632→1758) and no env
+> gate was added. Deployed bundle: `main-BYLUDOPH.js` (`APP_VERSION 1.16.0`),
+> built by the `frontend-builder` stage from THIS tree.
+
+> **2026-11-17 re-vendor (bf1bf3a → ca04586).** One upstream commit: the owner
+> asked for the ⏮️ button back. `skipPrevious()` (button + `previoustrack`
+> handler) is restored as `stopAndAdvance(left, manualPrevMode(autoplayMode()))`
+> — a new pure `manualPrevMode` in `autoplay-order.ts` flips the chosen mode to
+> its opposite direction ('newer'/'newest' → 'older', 'older'/'oldest'/'off' →
+> 'newer'), always relative, so a Next then Previous returns the origin track —
+> and both halves are gated on `skipMarksWatched`: with that setting on, ⏭️
+> MARKS the left track finished (out of the queue and the bag), so a back step has
+> nothing to undo, hence the button is not rendered and the handler no-ops (it
+> stays registered, or the OS key becomes a rewind). `app.component.html` gains
+> the `@if (!skipMarksWatched())` around the button and `app.component.ts` the
+> import, the `APP_VERSION 1.15.0` bump and the method; T6 grew 43 → 49
+> assertions. My edit touched only regions the mount patches do not (the import
+> line 15 and the handler block beside `skipNext`), so the re-copy is again a
+> clean `git merge-file`, 0 conflicts, and the patch set below is **byte-unchanged
+> in content** — only the `diff` line offsets of the last five `app.component.ts`
+> hunks move (+54: 1514→1568, 1543→1597, 1578→1632, 1587→1641, 1632→1686), and no
+> env gate was added or changed.
+> `autoplay-order.ts`, `app.component.html`, `tests/autoplay-order.test.mjs`,
+> `AGENTS.md` and `ARCHITECTURE.md` stay byte-identical copies of upstream.
+> Deployed bundle: `main-CZLG6CYG.js` (`APP_VERSION 1.15.0`, one `skipPrevious`
+> reference), built by the `frontend-builder` stage from THIS tree — the vendored
+> `app.component.ts` carries the mount patches, so its hash differs from a build
+> of the bare upstream tree (`main-72LZIXZ7.js`).
 
 > **2026-11-17 re-vendor (0642f8a → bf1bf3a).** Three upstream commits, on
 > history that was rewritten the same day (the hub-hostname scrub), so every
@@ -96,7 +141,7 @@ moves the real state to `/data`, where the hub keeps it.
 Carried along byte-identical from upstream (no listen patch):
 `frontend/src/app/autoplay-order.ts` (the pure advance pick, imported by
 `app.component.ts`), `frontend/src/app/stall-guard.ts` (exports `streamTrackId`),
-`tests/autoplay-order.test.mjs` (T6), `tests/stall-guard.test.mjs` (T4, 53
+`tests/autoplay-order.test.mjs` (T6), `tests/stall-guard.test.mjs` (T4, 64
 assertions), `tests/pure-logic.test.mjs` (T2 §16-§18: the authorship marker, the
 `folderCorruptionReason` verdict, the consume route), `tests/content-audit.mjs`
 (A14/A14b key orphan and grabby-label checks on the `createdAt` marker),
@@ -142,7 +187,7 @@ gateway leaves the tail intact, which it does — `location /l/<slug>/api/`
 proxies with no rewrite (only the tuner's `/l/<slug>/api/` rewrites, and that is
 tunester, never the stream) and the front partition's bare aliases forward
 `/api/stream/…` unchanged. T4's `streamTrackId` cases prove both shapes
-(`node tests/stall-guard.test.mjs`, now 53 assertions). mediaSession artwork
+(`node tests/stall-guard.test.mjs`, now 64 assertions). mediaSession artwork
 still uses `video.thumbnailPath` exactly as index.json carries it — prefixed by
 the backend, so nothing here needed a change.
 
