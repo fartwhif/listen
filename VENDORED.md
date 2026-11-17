@@ -16,7 +16,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 
 | Tree | Upstream | SHA | Patched files |
 |---|---|---|---|
-| `stack/drivepod/` | `fartwhif/DrivePod` | `1db5b425ab4b14208360b4edc51730dccdd9373e` (2026-11-16) | 2 |
+| `stack/drivepod/` | `fartwhif/DrivePod` | `23b03a9caf34d0572e42a39d56ca661474cb58f5` (2026-11-16) | 2 |
 | `stack/grabbytube/` | `fartwhif/GrabbyTube` | `6d636e06736304a452ca901451849e2618fb1b9f` (2026-11-15) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `92bcc1f41c559f3498c30a51cd36013d9b5902e0` | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
@@ -40,7 +40,20 @@ moves the real state to `/data`, where the hub keeps it.
 
 ---
 
-## `stack/drivepod/` — DrivePod @ 1db5b42
+## `stack/drivepod/` — DrivePod @ 23b03a9
+
+> **2026-11-16 re-vendor (1db5b42 → 23b03a9).** Upstream changed the grabby
+> shufflebag (played tracks now leave the bag: `initShuffleBag` set-asides
+> watched rows, `reconcileShuffleBag` gained a third `pruneIds` argument,
+> `distributeGrabbyItems` skips played pulls, and the watched/unwatched routes
+> call a new `syncBagForWatched`) and the frontend's `newest` autoplay (a new
+> `_playFreshest` that re-fetches `index.json` before picking — it reuses the
+> existing `fetchIndexWithProgress()` helper, so it inherits this tree's
+> `${MOUNT}/cache/…` patch for free). Upstream's new lines and the eleven hub
+> patches touched **disjoint** regions of both patched files, so this re-copy
+> was a clean 3-way merge (`git merge-file`, 0 conflicts): the patch set below
+> is byte-unchanged, and every added line is upstream's, not a new patch. No
+> env gate was introduced or changed.
 
 `backend/src/server.ts` (11 hunks)
 
