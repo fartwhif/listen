@@ -59,8 +59,9 @@ moves the real state to `/data`, where the hub keeps it.
 > are unaffected; `AGENTS.md` / `ARCHITECTURE.md` are byte-copies of upstream.
 > Only the hunk offsets move (new-side starts 96→99, 109→124, 571→589,
 > 1182→1230, 1514→1616, 1543→1645, 1578→1689, 1587→1699, 1632→1758) and no env
-> gate was added. Deployed bundle: `main-BYLUDOPH.js` (`APP_VERSION 1.16.0`),
-> built by the `frontend-builder` stage from THIS tree.
+> gate was added. Deployed bundle: `main-FET5B5YG.js` (`APP_VERSION 1.16.0`,
+> built by the `frontend-builder` stage from THIS tree; the bare upstream tree
+> builds `main-BYLUDOPH.js`).
 
 > **2026-11-17 re-vendor (bf1bf3a → ca04586).** One upstream commit: the owner
 > asked for the ⏮️ button back. `skipPrevious()` (button + `previoustrack`
