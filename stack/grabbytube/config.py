@@ -40,9 +40,14 @@ class Settings(BaseSettings):
     ytdlp: str = "yt-dlp"
     bgutil_url: str = "http://grabbytube-bgutil:4416"
 
-    # LLM duplicate detection
+    # LLM duplicate detection. `llm_model` is the id sent to the endpoint: the
+    # default is the 27B model this feature was written against; a deployment on
+    # a different served model overrides it with GRABBY_LLM_MODEL rather than
+    # editing code (an endpoint serving one model aliases any name, so the stale
+    # default still answers - it just names the wrong model in the request).
     llm_api_key: str = ""
     llm_base_url: str = ""
+    llm_model: str = "qwen3.6-27b"
 
     # YouTube cookies (Netscape format)
     youtube_cookies: str = ""

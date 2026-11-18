@@ -17,7 +17,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 | Tree | Upstream | SHA | Patched files |
 |---|---|---|---|
 | `stack/drivepod/` | `fartwhif/DrivePod` | `00f68c4d201b1af612fd30b113b457b8fb605233` (2026-11-17) | 2 |
-| `stack/grabbytube/` | `fartwhif/GrabbyTube` | `6964c030acb4717772b2d7202a4494cc28fb954b` (2026-11-17) | 8 |
+| `stack/grabbytube/` | `fartwhif/GrabbyTube` | `bcf7832bdae4fbd87de2df8cd10d0642d72696cc` (2026-11-18) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `b65948cae8ae1a7e722d2cc9767e18a9c388f4bc` (2026-11-18) | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
 | `stack/vault/` | `fartwhif/ytcookies` | `8c3d0903b58f1576e349ff2b6c8d97d688a61851` | 1 |
@@ -200,7 +200,28 @@ tunester, never the stream) and the front partition's bare aliases forward
 still uses `video.thumbnailPath` exactly as index.json carries it — prefixed by
 the backend, so nothing here needed a change.
 
-## `stack/grabbytube/` — GrabbyTube @ 6964c03
+## `stack/grabbytube/` — GrabbyTube @ bcf7832
+
+> **2026-11-18 re-vendor (6964c03 → bcf7832).** One upstream commit, from the
+> owner's "use this for the GrabbyTube API URL and access information" instruction
+> (`https://…/v1` + an `sk-…` bearer key): `find_duplicates` — GrabbyTube's ONLY
+> LLM call, behind `GET /tracks/duplicates` — hardcoded `"model": "qwen3.6-27b"`,
+> so re-pointing `GRABBY_LLM_BASE_URL`/`_API_KEY` at a server serving a different
+> model left the request naming an id the server honoured only by ALIASING (this
+> box's llama.cpp serves exactly one model and answers any id, naming the model it
+> actually ran — so the feature looked fine while lying about what judged the
+> library). Upstream added `settings.llm_model` (`GRABBY_LLM_MODEL`, default
+> `qwen3.6-27b` ⇒ the standalone container's request body is unchanged); the hub
+> ships the new trio base URL / key / model, and
+> `platform/tests/test_grabby_dedup_llm.py` (8 tests, `aiohttp` replaced by a
+> recorder) locks the request's URL + bearer header + model id, the
+> unset-name default, the cleaned numbered prompt, the `content`-OR-
+> `reasoning_content` parse fallback, and that the credential gate and a
+> <2-track library send NO request at all. Byte-level cutover of the two files
+> upstream changed; patch set proven **unchanged in content** — the vendored-vs-
+> pin `>`/`<` line-sets for `config.py` (46 lines) and `db.py` (47) are identical
+> at both pins, so no hub gate moved — and the untouched vendored files stay at
+> `6964c03` blob-for-blob.
 
 > **2026-11-17 re-vendor (f0f0aae → 6964c03).** One upstream commit, the owner's
 > "the retune queue is empty when I come back" report: the tunester list lived
