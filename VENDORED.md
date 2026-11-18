@@ -18,7 +18,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 |---|---|---|---|
 | `stack/drivepod/` | `fartwhif/DrivePod` | `00f68c4d201b1af612fd30b113b457b8fb605233` (2026-11-17) | 2 |
 | `stack/grabbytube/` | `fartwhif/GrabbyTube` | `02f75aa31167a34430af3feee17a621476be48b2` (2026-11-18) | 8 |
-| `stack/tunester/` | `fartwhif/tunester` | `c5df5874a2e2012c0a2a1e237c691d9751df0611` (2026-11-18) | 3 |
+| `stack/tunester/` | `fartwhif/tunester` | `a310334e6ddcdde49bba71bc30555b6903462958` (2026-11-18) | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
 | `stack/vault/` | `fartwhif/ytcookies` | `8c3d0903b58f1576e349ff2b6c8d97d688a61851` | 1 |
 | `stack/streamfix/` | `FrogRock/dnas/stream-fix` (same SHA) | `7585c5479ad23d234065c379761a78de2c266591` | 0 |
@@ -279,7 +279,7 @@ the backend, so nothing here needed a change.
 | `tunester.py` | `_slug_header()` sends `X-Partition-Slug` on `POST /api/tune`, `GET /api/job/<id>`, `GET /api/dl/<jid>`, `POST /api/clear`; `_hardlink_delivery()` uses `os.link` + `os.replace` when the download response carries `X-Pool-Path` (see `platform/poolimport.py`), else today's streamed write | header absent ⇒ no header; no `X-Pool-Path` ⇒ streamed bytes |
 | `static/index.html`, `static/js/app.js` | `API` derived from `document.baseURI` (empty standalone, `/l/<slug>/grabby` under the gateway); shell refs made relative | |
 
-## `stack/tunester/` — tunester @ c5df587
+## `stack/tunester/` — tunester @ a310334
 
 | File | Patch | Gate |
 |---|---|---|
@@ -300,11 +300,26 @@ byte-unchanged at the new pin: the vendored-vs-upstream added/removed CONTENT
 line-sets are 2/50, and the 2 removed lines plus those 50 are exactly the
 `TUNESTER_COOKIES` cookie-selection patch — the ten acoustid `body` lines that
 counted as vendored-only at the old pin are upstream's own now, so they cancel.
-`AGENTS.md`/`README.md`/`lookups.py`/`llm.py`/`app.py`/`LICENSE` are byte-copies
-of `c5df587` (`eaba24e8…`, `8f59535d…`, `9c6801ac…`, `93e8f688…`, `cba7eb54…`);
+`AGENTS.md`/`README.md`/`lookups.py`/`llm.py`/`app.py`/`LICENSE` were byte-copies
+of `c5df587` (`eaba24e8…`, `8f59535d…`, `9c6801ac…`, `93e8f688…`, `cba7eb54…`).
 `pipeline.py`/`sources.py`/`web.py` keep only the patches above. Upstream's two
 code commits changed `llm.py` and `pipeline.py`, and `COPY stack/tunester
 ./tunester` bakes the docs too, so the pin bump DOES want a rebuild.
+
+2026-11-18 (`c5df587` → `a310334`: `lookups.key` now stringifies its parts,
+because `("ytdlp", prefix, depth, …)` names a listing by the NUMBER of results
+it asked for and `"\x1f".join` refused it — every yt-dlp-backed source
+(YouTube and SoundCloud) died inside the wrapper with `sequence item 2:
+expected str instance, int found`, so a tune logged an empty catalog instead of
+missing a key). `a310334`'s range is exactly `lookups.py` + `AGENTS.md`, both
+byte-copies here, so the install is two `cp`s with nothing to merge:
+`pipeline.py`/`sources.py`/`web.py` are untouched by upstream and their
+vendored-vs-pin added/removed CONTENT line-sets (52 / 25 / 231 lines) are
+IDENTICAL at `c5df587` and at `a310334` — the patch set did not move.
+Byte-copies at the new pin: `lookups.py` `582f7e19…`, `AGENTS.md` `dbc3eb24…`
+(`README.md`/`llm.py`/`app.py`/`LICENSE` unchanged from `c5df587`). The doc
+change lands in the vendored `AGENTS.md`, and `COPY stack/tunester ./tunester`
+bakes it, so this pin bump wants a rebuild.
 
 ## `stack/frogrock/` — FrogRock @ 7585c54
 

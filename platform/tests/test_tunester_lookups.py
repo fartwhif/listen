@@ -309,6 +309,28 @@ def test_keys_separate_parts_that_concatenate_the_same_way(tune):
     assert lk.key("a", "b") == lk.key("a", "b")
 
 
+def test_a_number_in_a_key_names_the_answer_it_does_not_break_the_store(
+        cache, tune, log):
+    """`depth` is the NUMBER a search asked with, and a duration can be one
+    too. `"\x1f".join` raising `TypeError` INSIDE the wrapper is worse than
+    a miss: the SoundCloud search died with `sequence item 2: expected str
+    instance, int found`, so the whole yt-dlp-backed source found nothing and
+    the log looked like an empty catalog. Parts are stringified, and a str
+    part keys exactly as before (no stored entry moves)."""
+    lk = tune["lookups"]
+    assert lk.key("ytdlp", "scsearch", 15, "artist title", "") == \
+        lk.key("ytdlp", "scsearch", "15", "artist title", "")
+    assert lk.key("acoustid", "host", "fp", 227) != \
+        lk.key("acoustid", "host", "fp", 234)
+    assert lk.key("a", 1) != lk.key("a1")            # still no collisions
+    hit, got = lk.cached("search", ("ytdlp", "scsearch", 15, "artist title", ""),
+                         lambda: b"listing", log, source="ytsearch")
+    assert (hit, got) == (False, b"listing")
+    assert lk.cached("search", ("ytdlp", "scsearch", 15, "artist title", ""),
+                     lambda: b"never-called", log, source="ytsearch") == \
+        (True, b"listing")
+
+
 def test_enabled_scope_switches_the_store_off_without_deleting_it(cache,
                                                                   tune, log):
     lk = tune["lookups"]
@@ -683,6 +705,91 @@ def test_an_unparseable_archive_org_reply_forgets_its_own_entry(cache, tune,
     assert not blob_pair(cache, lk.key("ao", url))
     assert src._cached_json(url, "reference", log) == {"files": ["a"]}
     assert http.n == 2
+
+
+class Runs:
+    """`subprocess.run` as a scripted recorder: one canned reply per call,
+    and the argv it was called with."""
+
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.cmds = []
+
+    def __call__(self, cmd, **kw):
+        self.cmds.append([str(c) for c in cmd])
+        if not self.replies:
+            raise AssertionError(
+                f"unexpected subprocess call #{len(self.cmds)}")
+        return self.replies.pop(0)
+
+    @property
+    def n(self):
+        return len(self.cmds)
+
+
+def listing(kind: str = "scsearch", code: int = 0, *ids: str):
+    """A yt-dlp `--dump-json` reply: one JSON line per upload, as a
+    `subprocess.CompletedProcess` shape."""
+    soundcloud = kind == "scsearch"
+    lines = []
+    for n, vid in enumerate(ids):
+        entry = {
+            "id": vid,
+            "url": ("https://soundcloud.com/u/x/" + vid if soundcloud
+                    else f"https://www.youtube.com/watch?v={vid}"),
+            "title": f"Goodbye Goodbye {vid}",
+            "uploader": "Oingo Boingo",
+            "duration": 234,
+            ("playback_count" if soundcloud else "view_count"): 100 + n,
+        }
+        lines.append(json.dumps(entry).encode() + b"\n")
+    return types.SimpleNamespace(returncode=code,
+                                 stdout=b"".join(lines), stderr=b"")
+
+
+def test_a_yt_dlp_search_listing_is_asked_for_once(cache, tune, log,
+                                                   monkeypatch):
+    """The flat-playlist listing is yt-dlp's slow round-trip (seconds to tens
+    of seconds) and the SAME `Artist Title` reappears on every re-tune and on
+    every `GrabbyTube /tracks/tunester` batch, so the RAW stdout is stored:
+    the ranking filters keep running per run, the subprocess does not."""
+    lk, src = tune["lookups"], tune["sources"]
+    monkeypatch.setattr(src.subprocess, "run",
+                        runs := Runs(listing("scsearch", 0, "a1", "a2")))
+    first = src._yt_search("scsearch", "Oingo Boingo", "Goodbye Goodbye",
+                           None, log=log)
+    assert [c.url for c in first] == ["https://soundcloud.com/u/x/a1",
+                                      "https://soundcloud.com/u/x/a2"]
+    assert runs.n == 1 and runs.cmds[0][1] == (
+        f"scsearch{src.SEARCH_DEPTH}:Oingo Boingo Goodbye Goodbye")
+    entry = lk.key("ytdlp", "scsearch", src.SEARCH_DEPTH,
+                   "Oingo Boingo Goodbye Goodbye", "")
+    assert (cache / "lookups" / f"{entry}.bin").read_bytes() == \
+        listing("scsearch", 0, "a1", "a2").stdout       # the raw listing, not candidates
+    again = src._yt_search("scsearch", "Oingo Boingo", "Goodbye Goodbye",
+                           None, log=log)
+    assert [c.url for c in again] == [c.url for c in first]
+    assert runs.n == 1, "a cached listing must not pay for yt-dlp again"
+    assert "lookup cache hit (search)" in " ".join(log)
+
+
+def test_a_failed_yt_dlp_listing_publishes_no_emptiness(cache, tune, log,
+                                                        monkeypatch):
+    """A non-zero yt-dlp (age-gated, dead session, rate-limited) is the source
+    NOT answering. Freezing its empty stdout as "no such uploads" would hide
+    every real upload for the whole TTL, and it would poison the key the
+    working session could have filled."""
+    lk, src = tune["lookups"], tune["sources"]
+    monkeypatch.setattr(src.subprocess, "run",
+                        runs := Runs(listing("scsearch", 1),
+                                     listing("scsearch", 0, "b1")))
+    assert src._yt_search("scsearch", "dead session", "song", None,
+                          log=log) == []
+    entry = lk.key("ytdlp", "scsearch", src.SEARCH_DEPTH, "dead session song", "")
+    assert not blob_pair(cache, entry)
+    got = src._yt_search("scsearch", "dead session", "song", None, log=log)
+    assert [c.url for c in got] == ["https://soundcloud.com/u/x/b1"]
+    assert runs.n == 2
 
 
 # ---------------------------------------------------------------------- model
