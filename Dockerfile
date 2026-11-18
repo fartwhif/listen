@@ -68,6 +68,29 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HUB_DATA_DIR=/data \
     HUB_CONF_DIR=/etc/stack
 
+# The archiver/fingerprint tools are tunester's own upstream apt list, which
+# the consolidated runtime stage dropped. Nothing fails loudly when they are
+# absent - every one is a `shutil.which` probe, so the pipeline degrades
+# quietly. That is how it stayed broken for a whole day: with no `fpcalc` the
+# AcoustID CONTENT gate - the only check that catches a mislabeled file, a
+# wrong cut, or a live take - never ran on a hub tune (10 `acoustid:
+# unavailable - gate skipped` lines in this container's tuner log), and every
+# cached delivery was served without its fingerprint re-check.
+#   libchromaprint-tools  fpcalc: chromaprint for the AcoustID identity /
+#                         live-take / zero-coverage gate (pipeline
+#                         _fingerprint) and for the re-check `_delivery_get`
+#                         runs on every store hit
+#   unar                  the extract step of the RAR/ZIP/7z/tar(.gz/.bz2/.xz)
+#                         sets a release is posted in (NZB_ARCHIVE_EXTS);
+#                         verified in-image that unar decodes xz and bz2
+#                         itself, so no external xz/bzip2/zstd is needed
+#   par2                  verify (and repair) a posted set before extracting
+#   p7zip-full            upstream's 7z CLI; tunester extracts 7z with unar,
+#                         so this is parity with its container, not a code path
+# Not carried over: `sudo`, which FrogRock's and DNAS's own entrypoints use to
+# drop to appuser/scserv. Every hub program runs as root (gen-conf emits no
+# `user=`), so nothing here invokes it. GrabbyTube's `nodejs` is not carried
+# over either: nothing in that tree runs `node`, and the base image is node 22.
 # yt-dlp is invoked as a COMMAND by both downloaders (DrivePod builds a shell
 # string, GrabbyTube passes argv), so exactly one install on PATH is needed,
 # pinned so the pip POT plugin and the command agree on version.
@@ -75,6 +98,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl wget unzip gnupg \
         python3 python3-pip python3-venv \
         ffmpeg vbrfix \
+        libchromaprint-tools unar p7zip-full par2 \
         nginx \
         supervisor \
         wireguard iproute2 iptables procps iputils-ping \

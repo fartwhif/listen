@@ -18,7 +18,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 |---|---|---|---|
 | `stack/drivepod/` | `fartwhif/DrivePod` | `00f68c4d201b1af612fd30b113b457b8fb605233` (2026-11-17) | 2 |
 | `stack/grabbytube/` | `fartwhif/GrabbyTube` | `6964c030acb4717772b2d7202a4494cc28fb954b` (2026-11-17) | 8 |
-| `stack/tunester/` | `fartwhif/tunester` | `92bcc1f41c559f3498c30a51cd36013d9b5902e0` | 3 |
+| `stack/tunester/` | `fartwhif/tunester` | `47006cc65e79a31b7877b3f60921048322d62a68` (2026-11-18) | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
 | `stack/vault/` | `fartwhif/ytcookies` | `8c3d0903b58f1576e349ff2b6c8d97d688a61851` | 1 |
 | `stack/streamfix/` | `FrogRock/dnas/stream-fix` (same SHA) | `7585c5479ad23d234065c379761a78de2c266591` | 0 |
@@ -237,13 +237,23 @@ the backend, so nothing here needed a change.
 | `tunester.py` | `_slug_header()` sends `X-Partition-Slug` on `POST /api/tune`, `GET /api/job/<id>`, `GET /api/dl/<jid>`, `POST /api/clear`; `_hardlink_delivery()` uses `os.link` + `os.replace` when the download response carries `X-Pool-Path` (see `platform/poolimport.py`), else today's streamed write | header absent ⇒ no header; no `X-Pool-Path` ⇒ streamed bytes |
 | `static/index.html`, `static/js/app.js` | `API` derived from `document.baseURI` (empty standalone, `/l/<slug>/grabby` under the gateway); shell refs made relative | |
 
-## `stack/tunester/` — tunester @ 92bcc1f
+## `stack/tunester/` — tunester @ 47006cc
 
 | File | Patch | Gate |
 |---|---|---|
 | `pipeline.py` | `cookie_candidates()`: when `TUNESTER_COOKIES` lists every partition's jar, offer only readable non-empty files sorted **newest-mtime-first** — the vault exports while its session is live, so the newest jar is the one a browser refreshed last, and a dead jar on YouTube looks like "all sources exhausted". `find_cookies()` keeps an explicit `--cookies` outranking them. The download passes the chosen jar to `browser_user_agent(cookies)` | `TUNESTER_COOKIES` unset ⇒ `COOKIES_CANDIDATES`, unchanged |
 | `sources.py` | `browser_user_agent(cookies)` reads the state file **next to the jar it is describing** (`session-state.json` is written beside each export): the hub's newest-jar-wins choice otherwise pairs one partition's session with another's UA, and a mismatched UA on a live session is a kill signal. Lookup keyed on `TUNESTER_COOKIES` being set; the search call site passes the jar too | unset ⇒ today's single state file |
 | `web.py` | single-flight: `_PENDING` keyed on `sources._norm(name)` (the shape the delivery cache hashes), consulted only for requests carrying `X-Partition-Slug`; a request for a song already being found ATTACHES (`attached: true`, waiter recorded) instead of fetching again, and the key is released in a `finally` with an identity check so a later request keeps its own claim. Blob serving: on success `platform/poolimport.blob_for()` puts the rip in the content-addressed store, `/api/dl` serves the BLOB and names it in `X-Pool-Path`; a blob-store failure is logged in the job and the output-dir copy is served, so it never looks like a failed tune. `_job_view`/`_job_public` add `slug`/`waiters` only for hub jobs. `_tune_one()` converts the pipeline's own `sys.exit()` into a `RuntimeError` so the worker's `except SystemExit` arm stops swallowing blob failures and dropping the `target` fixup. `_load_poolimport()` resolves `platform/` via `STACK_DIR` or one/two parents up, `None` standalone | header unset ⇒ today's responses key for key; `TUNESTER_BLOBS` unset ⇒ job keeps its own file |
+
+2026-11-18 re-vendor (`92bcc1f` → `47006cc`, upstream's obfuscated-name tiers +
+cached-manifest sweep) installed with a **clean 3-way merge** (`git merge-file`,
+0 conflicts): upstream touched `_nzb_file_name`, the NZB constants, the
+compilation-scan tail and the end of `tune`, the hub patches the cookie
+selection, `sources.py` and `web.py` — disjoint regions. Patch set proven
+byte-unchanged: the vendored-vs-pin added/removed CONTENT line-sets (235/4) are
+identical to upstream's own diff, so no hub gate moved. Vendored `AGENTS.md` is
+a byte-copy of `47006cc` (`a943116d…`); `app.py`/`llm.py`/`README.md`/`LICENSE`
+are unchanged upstream blobs, `sources.py`/`web.py` keep only the patches above.
 
 ## `stack/frogrock/` — FrogRock @ 7585c54
 
