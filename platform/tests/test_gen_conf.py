@@ -383,6 +383,28 @@ def test_credentials_are_forwarded_only_when_set(two, monkeypatch):
     assert "GOOGLE_EMAIL" not in env_of(blocks["vault-owner"])
 
 
+def test_answer_store_lifetimes_reach_the_shared_tuner(two, monkeypatch):
+    """The pool is the ONE tuner every partition shares, so its answer cache
+    is shared too - a lifetime knob is a box-wide decision and has to arrive
+    at the tunester program, or `lookup_ttl` silently keeps its default.
+    Unset must stay absent (tunester's own default), like every other name."""
+    for name, value in (("TUNESTER_LOOKUP_TTL_HOURS", "24"),
+                        ("TUNESTER_SEARCH_TTL_MINUTES", "30"),
+                        ("TUNESTER_LLM_TTL_HOURS", "0")):
+        monkeypatch.setenv(name, value)
+    pool = env_of(program_blocks(gen.supervisor_conf(two))["tunester"])
+    assert pool["TUNESTER_LOOKUP_TTL_HOURS"] == "24"
+    assert pool["TUNESTER_SEARCH_TTL_MINUTES"] == "30"
+    # 0 is the kill switch, so the literal 0 has to survive the quoting.
+    assert pool["TUNESTER_LLM_TTL_HOURS"] == "0"
+    for name in gen.TUNESTER_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    pool = env_of(program_blocks(gen.supervisor_conf(two))["tunester"])
+    for name in ("TUNESTER_LOOKUP_TTL_HOURS", "TUNESTER_SEARCH_TTL_MINUTES",
+                 "TUNESTER_LLM_TTL_HOURS"):
+        assert name not in pool, name
+
+
 def test_vault_env_gets_push_targets_and_door(two, monkeypatch):
     monkeypatch.setattr(gen, "SITE_DOMAIN", "listen.example.com")
     blocks = program_blocks(gen.supervisor_conf(two))

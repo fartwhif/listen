@@ -105,6 +105,14 @@ TUNESTER_KEYS = (
     "TUNESTER_SEARCH_DEPTH", "TUNESTER_SEARCH_TIMEOUT", "TUNESTER_TRIALS",
     "TUNESTER_DOWNLOAD_TIMEOUT", "TUNESTER_HTTP_TIMEOUT",
     "TUNESTER_CACHE_MAX_MB", "TUNESTER_FFMPEG", "TUNESTER_FFPROBE",
+    # answer-store lifetimes (stack/tunester/lookups.py): the pool is the ONE
+    # tuner every partition shares, so its answer cache is shared too - these
+    # knobs decide how long a MusicBrainz / AcoustID / archive.org answer, a
+    # catalog listing and a model verdict stay good for the whole box. Unset
+    # (the default) keeps tunester's own defaults, exactly like every other
+    # passthrough name.
+    "TUNESTER_LOOKUP_TTL_HOURS", "TUNESTER_SEARCH_TTL_MINUTES",
+    "TUNESTER_LLM_TTL_HOURS",
 )
 VAULT_KEYS = (
     "GOOGLE_EMAIL", "GOOGLE_PASSWORD", "VNC_PASSWORD", "VNC_RESOLUTION",
