@@ -17,7 +17,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 | Tree | Upstream | SHA | Patched files |
 |---|---|---|---|
 | `stack/drivepod/` | `fartwhif/DrivePod` | `00f68c4d201b1af612fd30b113b457b8fb605233` (2026-11-17) | 2 |
-| `stack/grabbytube/` | `fartwhif/GrabbyTube` | `6d636e06736304a452ca901451849e2618fb1b9f` (2026-11-15) | 8 |
+| `stack/grabbytube/` | `fartwhif/GrabbyTube` | `6964c030acb4717772b2d7202a4494cc28fb954b` (2026-11-17) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `92bcc1f41c559f3498c30a51cd36013d9b5902e0` | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
 | `stack/vault/` | `fartwhif/ytcookies` | `8c3d0903b58f1576e349ff2b6c8d97d688a61851` | 1 |
@@ -200,7 +200,30 @@ tunester, never the stream) and the front partition's bare aliases forward
 still uses `video.thumbnailPath` exactly as index.json carries it — prefixed by
 the backend, so nothing here needed a change.
 
-## `stack/grabbytube/` — GrabbyTube @ 6d636e0
+## `stack/grabbytube/` — GrabbyTube @ 6964c03
+
+> **2026-11-17 re-vendor (f0f0aae → 6964c03).** One upstream commit, the owner's
+> "the retune queue is empty when I come back" report: the tunester list lived
+> only in `_progress`, so `GET /tracks/tunester` was empty after any container
+> start and a mid-flight batch was never resumed. Upstream persists the batch to
+> the `config` table (row `tunester_run`) on status changes and resumes it from
+> the lifespan; `platform/tests/test_tunester_run_state.py` (18 tests) locks that
+> behaviour against THIS tree. Upstream's additions and the hub patches touched
+> **disjoint** regions (`_slug_header()`/`_hardlink_delivery()` sit outside
+> `restore()`/`_persist()`/`clear_run()`, and the new `from db import …
+> get_config, … set_config` line extends the import line the patch table already
+> relies on), so the re-copy is a byte-level cutover of the four files upstream
+> changed, not a merge: the patch set below is **unchanged in content** — the same
+> 23 `>`/`<` lines in `main.py`, 79 in `tunester.py`, 14 in `app.js`, 9 in
+> `index.html` — and no env gate was added or removed. Only `main.py`'s and
+> `tunester.py`'s hunk offsets move (`main.py` -28→-29, -76→-83; `tunester.py`
+> -31→-33, -154→-322, -163→-331, -323→-493) because upstream grew the file above
+> them; `config.py`, `db.py`, `api/routes.py`, `processor.py` and every byte-equal
+> file are untouched by the upstream commit (blob hashes identical at both pins).
+> `6d636e0` is dead upstream — the 2026-11-17 GrabbyTube history rewrite moved the
+> old pin to `f0f0aae` (tree blob-for-blob identical) to scrub one Windows
+> media-mount path out of an early commit body; the pin moved with it.
+
 
 | File | Patch | Gate |
 |---|---|---|
@@ -210,7 +233,7 @@ the backend, so nothing here needed a change.
 | `api/routes.py` | `GET/POST /settings/yt-dlp` read/write `settings.ytdlp` and `settings.bgutil_url` instead of hardcoded text, persisted through the existing `set_config` store | |
 | `processor.py` | `_COOKIES_FILE` is the env-named partition file (upload/delete write a real partition path); `effective_cookies_file()` offers `[settings.cookies_file] + (shared, local)` with the same exists-and-non-empty skip, so a fresh partition with no export still passes no `--cookies`; bgutil `base_url` and both `["yt-dlp"]` argv heads come from settings; **`_write_mp3_tags` copy-on-write** — when a partition slug is set and the file has `st_nlink > 1`, copy + `os.replace` gives this copy a private inode before mutagen saves, because mutagen writes through the fd and retitling a blob link would rewrite the shared `/data/pool/blobs/<sha256>.mp3` and leave its hash-name describing the wrong bytes | slug unset ⇒ no `stat()`, in-place save as today |
 | `processor.py` (worker) | real concurrency cap: upstream `await`ed one job before taking the next, so `settings.max_concurrent` could never exceed 1 and `quota.concurrentDownloads` was decorative. The hub loop claims jobs into `asyncio.create_task` up to `max_concurrent`, reaps with `asyncio.wait(FIRST_COMPLETED)`, and calls `reclaim_stale_jobs()` at start. Proven per partition: the quota-1 test partition's second job stayed `queued` until the first harvest ended, while a quota-2 partition ran two 6 s harvests in exact overlap | standalone: `max_concurrent`'s default 2 now genuinely means 2 |
-| `processor.py` (index) | `audioPath`/`thumbnailPath` stay **relative and unprefixed**: DrivePod resolves them against its own `CACHE_DIR` (`resolveGrabbyAudioPath`), and this app's UI sits under its own mount where a relative path already lands right. 6d636e0 rewrote this same file's `update_index_file()` so the index lists **only what this app authored** — an item JSON with a non-empty `createdAt` AND a catalog record (via `load_catalog()`, imported here already) — counting foreign folders and WARNing on `createdAt`-without-catalog, so an index entry is now an ownership statement, which is what DrivePod's `isGrabbyAuthored` filter reads. Output dir (`GRABBY_OUTPUT_DIR`) and catalog (`GRABBY_CATALOG_PATH`) still come from `config.py` settings, so a sweep sees only this tenant's cache | — |
+| `processor.py` (index) | `audioPath`/`thumbnailPath` stay **relative and unprefixed**: DrivePod resolves them against its own `CACHE_DIR` (`resolveGrabbyAudioPath`), and this app's UI sits under its own mount where a relative path already lands right. f0f0aae rewrote this same file's `update_index_file()` so the index lists **only what this app authored** — an item JSON with a non-empty `createdAt` AND a catalog record (via `load_catalog()`, imported here already) — counting foreign folders and WARNing on `createdAt`-without-catalog, so an index entry is now an ownership statement, which is what DrivePod's `isGrabbyAuthored` filter reads. Output dir (`GRABBY_OUTPUT_DIR`) and catalog (`GRABBY_CATALOG_PATH`) still come from `config.py` settings, so a sweep sees only this tenant's cache | — |
 | `tunester.py` | `_slug_header()` sends `X-Partition-Slug` on `POST /api/tune`, `GET /api/job/<id>`, `GET /api/dl/<jid>`, `POST /api/clear`; `_hardlink_delivery()` uses `os.link` + `os.replace` when the download response carries `X-Pool-Path` (see `platform/poolimport.py`), else today's streamed write | header absent ⇒ no header; no `X-Pool-Path` ⇒ streamed bytes |
 | `static/index.html`, `static/js/app.js` | `API` derived from `document.baseURI` (empty standalone, `/l/<slug>/grabby` under the gateway); shell refs made relative | |
 

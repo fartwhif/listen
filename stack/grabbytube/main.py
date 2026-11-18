@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from config import settings
 from db import init_db, get_config
 from api.routes import router, start_worker
+import tunester
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +39,12 @@ async def lifespan(app: FastAPI):
         if persisted and env not in os.environ:
             setattr(settings, attr, persisted)
             logger.info(f"{key} restored from database")
+    # A batch left running when this process went away comes back: its queue
+    # list is re-shown and its unfinished tracks keep tuning (tunester.restore).
+    # Needs the event loop, so it happens here rather than at import time.
+    resumed = tunester.restore()
+    if resumed:
+        logger.info(f"Tunester batch resumed: {resumed} track(s) still queued")
     start_worker()
     logger.info(f"Output directory: {settings.output_path}")
     yield
