@@ -17,7 +17,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 | Tree | Upstream | SHA | Patched files |
 |---|---|---|---|
 | `stack/drivepod/` | `fartwhif/DrivePod` | `00f68c4d201b1af612fd30b113b457b8fb605233` (2026-11-17) | 2 |
-| `stack/grabbytube/` | `fartwhif/GrabbyTube` | `bcf7832bdae4fbd87de2df8cd10d0642d72696cc` (2026-11-18) | 8 |
+| `stack/grabbytube/` | `fartwhif/GrabbyTube` | `02f75aa31167a34430af3feee17a621476be48b2` (2026-11-18) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `b65948cae8ae1a7e722d2cc9767e18a9c388f4bc` (2026-11-18) | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
 | `stack/vault/` | `fartwhif/ytcookies` | `8c3d0903b58f1576e349ff2b6c8d97d688a61851` | 1 |
@@ -200,7 +200,28 @@ tunester, never the stream) and the front partition's bare aliases forward
 still uses `video.thumbnailPath` exactly as index.json carries it — prefixed by
 the backend, so nothing here needed a change.
 
-## `stack/grabbytube/` — GrabbyTube @ bcf7832
+## `stack/grabbytube/` — GrabbyTube @ 02f75aa
+
+> **2026-11-18 re-vendor (bcf7832 → 02f75aa).** One upstream commit, the owner's
+> "add a button to the library items that opens the original YouTube video": the
+> track cards gained a `YT` link (`btn btn-secondary btn-yt-track`,
+> `target="_blank" rel="noopener"`) beside Play/DL/Edit/Del, and `index.html`'s
+> `?v=` cache-bust moved 24 → 25. No backend change: the catalog has keyed on the
+> YouTube id since its first commit (`videoId`, and jobs store the watch URL that id
+> was extracted from), so the link is built in the template from data the card
+> already has. It needs **no hub patch of its own** — `youtube.com/watch?v=…` is an
+> absolute cross-origin URL, so it resolves identically standalone and mounted
+> (unlike the `API`/ref patches below, which exist only because those paths are
+> relative to the mount). `static/index.html` conflicts on the script tag because
+> both sides patch the same line (hub: relative ref; upstream: the bump), so that
+> one hunk resolved by hand to relative + `?v=25`; `app.js` merged clean with
+> `git merge-file` (0 conflicts — upstream's insertion is at the card action list,
+> the hub patch is at the top of the file). Patch set proven **unchanged in
+> content**: the vendored-vs-pin vs vendored-vs-new-pin `>`/`<` CONTENT line-sets
+> for `app.js` are identical (14 lines both sides), and `index.html`'s differ only
+> in the two lines upstream itself moved (the `?v=` tag and the comment that
+> referenced it) — no hub gate added or removed, and the other six patched files
+> stay at `bcf7832` blob-for-blob.
 
 > **2026-11-18 re-vendor (6964c03 → bcf7832).** One upstream commit, from the
 > owner's "use this for the GrabbyTube API URL and access information" instruction
