@@ -17,7 +17,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 | Tree | Upstream | SHA | Patched files |
 |---|---|---|---|
 | `stack/drivepod/` | `fartwhif/DrivePod` | `00f68c4d201b1af612fd30b113b457b8fb605233` (2026-11-17) | 2 |
-| `stack/grabbytube/` | `fartwhif/GrabbyTube` | `02f75aa31167a34430af3feee17a621476be48b2` (2026-11-18) | 8 |
+| `stack/grabbytube/` | `fartwhif/GrabbyTube` | `b1c27088e3e7ce91c2812a8d2d630bf79ab0c7de` (2026-11-18) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `a310334e6ddcdde49bba71bc30555b6903462958` (2026-11-18) | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
 | `stack/vault/` | `fartwhif/ytcookies` | `8c3d0903b58f1576e349ff2b6c8d97d688a61851` | 1 |
@@ -200,7 +200,33 @@ tunester, never the stream) and the front partition's bare aliases forward
 still uses `video.thumbnailPath` exactly as index.json carries it — prefixed by
 the backend, so nothing here needed a change.
 
-## `stack/grabbytube/` — GrabbyTube @ 02f75aa
+## `stack/grabbytube/` — GrabbyTube @ b1c2708
+
+> **2026-11-18 re-vendor (02f75aa → b1c2708).** One upstream commit, the owner's
+> "the retune list is empty whenever I come back, even though I left it running"
+> follow-up on the frontend side: the queue panel's reads are driven by one 1s
+> tick plus a **deadline** (`setTunesterNextPoll`) the last answer chose — 2 s
+> while a batch is live (a row moves at most every 5 s), 10 s idle (so a batch
+> started in another window or resumed by a restart still locks the button here),
+> 30 s when GrabbyTube is not answering — instead of a self-rearming
+> `setTimeout` chain. A chain dies with one browser timer, and a backgrounded tab
+> gets its timers clamped (1/s, then ~1/min), so the chain armed while visible
+> never rearms and the panel freezes for the rest of the batch; a missed tick only
+> delays a deadline, so the next tick reads at once. Poll repaints are suppressed
+> unless the row HTML actually changed (`tunesterRowsHtml`), because innerHTML
+> wipes scroll position and text selection and polls are continuous now; a poll
+> failure logs and backs off instead of alerting, and a taken-BEFORE-request
+> `panelGen` counter is what keeps a clear's answer from being painted over by a
+> read that started before it. `index.html`'s `?v=` moved 25 → 26. Both hub-
+> patched files touched: `app.js` merged clean with `git merge-file` (0 conflicts
+> — upstream's work is all in the tunester block plus the bottom poll list, the
+> hub patch is the `API` derivation in the header); `index.html` conflicted on the
+> script tag exactly as last round (hub: relative ref; upstream: the bump) and
+> that one hunk resolved by hand to relative + `?v=26`. Patch set proven
+> **unchanged in content**: `app.js`'s vendored-vs-pin `>`/`<` CONTENT line-sets
+> are identical at both pins (14 lines each); `index.html`'s are identical except
+> the two lines upstream itself moved (the `?v=` tag and the comment naming it).
+> The other six patched grabby files stay at `bcf7832` blob-for-blob.
 
 > **2026-11-18 re-vendor (bcf7832 → 02f75aa).** One upstream commit, the owner's
 > "add a button to the library items that opens the original YouTube video": the
