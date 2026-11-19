@@ -16,7 +16,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 
 | Tree | Upstream | SHA | Patched files |
 |---|---|---|---|
-| `stack/drivepod/` | `fartwhif/DrivePod` | `00f68c4d201b1af612fd30b113b457b8fb605233` (2026-11-17) | 2 |
+| `stack/drivepod/` | `fartwhif/DrivePod` | `54620bee51d311f6ba143178d7a55457f3d28d49` (2026-11-19) | 2 |
 | `stack/grabbytube/` | `fartwhif/GrabbyTube` | `b1c27088e3e7ce91c2812a8d2d630bf79ab0c7de` (2026-11-18) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `a310334e6ddcdde49bba71bc30555b6903462958` (2026-11-18) | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
@@ -40,7 +40,47 @@ moves the real state to `/data`, where the hub keeps it.
 
 ---
 
-## `stack/drivepod/` — DrivePod @ 00f68c4
+## `stack/drivepod/` — DrivePod @ 54620bee
+
+> **2026-11-19 re-vendor (00f68c4 → 54620bee).** One upstream commit, the fix for
+> the harvest tab's `session status unknown` badge — and for the reason it was
+> worth fixing here rather than upstream-only: `gen-conf`'s tenant env has named
+> each partition's state file (`…/users/<slug>/session-state.json`) since the hub
+> existed (5f49433), but the vendored backend still opened a hardcoded
+> `/shared-cookies/session-state.json`, which the hub never creates. ENOENT in
+> BOTH readers (the harvest gate and the status route had separate reads), so the
+> badge reported "unknown" for the whole container lifetime while the vault's own
+> file said `up`, and the gate blocked nothing: 96 admitted harvest rounds, zero
+> `Cookie session dead` log lines. A missing file is indistinguishable from a
+> gate that was never wired, so the silent half — a genuine `down` verdict being
+> ignored — was the actual hazard.
+> Upstream put the path behind `COOKIE_SESSION_STATE`, the name `gen-conf` and the
+> vendored exporter already used, and made `readSessionState()` the single reader
+> for the gate and the badge. **No hub patch was required** — the env key was
+> already emitted, the consumer just had to be taught to read it — which is
+> precisely the failure mode a rename on either side re-opens, so
+> `platform/tests/test_session_gate.py` now locks the producer↔consumer contract:
+> the key gen-conf writes is the key the vendored source reads, it points beside
+> that tenant's `COOKIES_FILE`, the host's fan-out list and the member's own env
+> name the same file, the backend has exactly ONE reader (no second
+> `fs.readFileSync` of a literal mount), a missing/torn/stale file is still NOT a
+> verdict, and the unset fallback is still the standalone mount.
+> `git merge-file` merged CLEAN (0 conflicts): upstream worked inside
+> `sessionGateOpen()` and the status route, the eleven mount patches are elsewhere,
+> so the patch set is **unchanged in content** — 11 hunks, the same 118 `>` and
+> 13 `<` content lines at both pins, sorted content line-set md5 `73a6c867…` on
+> both sides. Only the last three hunks' new-side offsets move by the +21 lines the
+> upstream commit adds (3544→3565, 3682→3703, 3753→3774); the table below is
+> otherwise exactly as recorded at `00f68c4`. `AGENTS.md`, `ARCHITECTURE.md` and
+> `tests/pure-logic.test.mjs` are byte-copies of the new pin (`a53f2962…`,
+> `abf2ec0a…`, `65fa2fc7…`); `backend/src/server.ts` is the merged tree
+> (`a6ff76eb…` upstream-side, this tree carries the 11 hunks). Upstream's
+> `.env.example` gained the documented knob but that file is not vendored (the hub
+> supplies the value through supervisor's tenant env, never an `env_file`). No
+> frontend file changed, so the built bundle stays `main-FET5B5YG.js`
+> (`APP_VERSION 1.16.0` unchanged at both pins). The image rebuild is owed for
+> exactly one file: `COPY stack/drivepod/backend/src ./drivepod/backend/src` bakes
+> `server.ts`; the vendored docs and `tests/` are not COPYed anywhere.
 
 > **2026-11-17 re-vendor (ca04586 → 00f68c4).** One upstream commit, the follow-up
 > round on the owner's report: `onerror` decided a media error's owner from
@@ -151,8 +191,9 @@ Carried along byte-identical from upstream (no listen patch):
 `frontend/src/app/autoplay-order.ts` (the pure advance pick, imported by
 `app.component.ts`), `frontend/src/app/stall-guard.ts` (exports `streamTrackId`),
 `tests/autoplay-order.test.mjs` (T6), `tests/stall-guard.test.mjs` (T4, 64
-assertions), `tests/pure-logic.test.mjs` (T2 §16-§18: the authorship marker, the
-`folderCorruptionReason` verdict, the consume route), `tests/content-audit.mjs`
+assertions), `tests/pure-logic.test.mjs` (T2 §16-§19: the authorship marker, the
+`folderCorruptionReason` verdict, the consume route, the session gate's file),
+`tests/content-audit.mjs`
 (A14/A14b key orphan and grabby-label checks on the `createdAt` marker),
 `AGENTS.md`, `ARCHITECTURE.md`.
 
