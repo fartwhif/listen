@@ -16,7 +16,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 
 | Tree | Upstream | SHA | Patched files |
 |---|---|---|---|
-| `stack/drivepod/` | `fartwhif/DrivePod` | `54620bee51d311f6ba143178d7a55457f3d28d49` (2026-11-19) | 2 |
+| `stack/drivepod/` | `fartwhif/DrivePod` | `ca9a6f7603d1cce54446f077def9e79cda92ad77` (2026-11-20) | 2 |
 | `stack/grabbytube/` | `fartwhif/GrabbyTube` | `b1c27088e3e7ce91c2812a8d2d630bf79ab0c7de` (2026-11-18) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `a310334e6ddcdde49bba71bc30555b6903462958` (2026-11-18) | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
@@ -40,7 +40,79 @@ moves the real state to `/data`, where the hub keeps it.
 
 ---
 
-## `stack/drivepod/` — DrivePod @ 54620bee
+## `stack/drivepod/` — DrivePod @ ca9a6f76
+
+> **2026-11-20 re-vendor (54620bee → ca9a6f7).** One upstream commit, three
+> transient-network latches that never released themselves — the owner's report was
+> "a flaky link leaves state stuck even after the link comes back", and all three
+> stuck states were real and each needed a different release:
+> (1) `deleteTempCookiesFile()` ran as the FIRST statement of the harvest `finally`,
+> an unguarded `fs.unlinkSync`, so a throw from it skipped the
+> `isHarvesting = false` lines below it in the same block. node-cron swallows the
+> rejection (`task-failed`, nobody listens), so the process stayed up, the flag
+> stayed true, and every later 5-min round logged "Harvest already running —
+> skipping" for the life of the container: an import route that refused for the
+> same reason, i.e. a permanently frozen queue behind a one-second disk hiccup.
+> Upstream made the cleanup best-effort (try/catch, `export`ed so T2 §20 can drive
+> it), moved `isHarvesting = true` INSIDE the `try` so the releasing `finally` is
+> armed from the instant the lock exists, and added the exported `harvestLockHeld`
+> read seam. (2) The frontend's watched/progress outbox had ONE `retryAttempts`
+> counter for the whole queue with a 10-attempt ceiling, so a 40 s blip charged
+> every queued op and an op that was simply waiting its turn was dropped unheard —
+> the server never persisted `watched=true`, and the next index poll put a finished
+> track back in the queue, forever. Upstream extracted the pure `retry-policy.ts`
+> (per-op budgets, 2 s × 2ⁿ capped at 60 s, transport failure = no verdict, 4xx =
+> drop, FIFO so an older op is never starved, and a just-unwatched mark CANCELS its
+> queued watched mark) and T7 drives it. (3) `MEDIA_ERR_NETWORK` was counted as a
+> defect of the FILE, and at `MAX_TRACK_PLAY_FAILURES` the app POSTed
+> `watched=true`: two 20 s blips mid-episode permanently finished a track nobody
+> heard. `mediaErrorIsTransportError` (code 2 is the one code a file on disk cannot
+> cause) keeps those errors out of the file's budget while still recovering them
+> through the watchdog's own 3-reload budget.
+> **The install had exactly ONE conflict**, in `deleteTempCookiesFile()`: upstream
+> rewrote the whole function body (doc comment + `try`/`catch` + `export`) and this
+> tree owns the `COOKIES_EXTERNALLY_OWNED` early return inside it — resolved by
+> keeping BOTH, upstream's `export` and try/catch with the hub's gate as the first
+> statement. That ordering is load-bearing: on the hub `COOKIES_FILE` is ALWAYS set
+> (`gen-conf`'s tenant env), so the delete returns before any syscall and the
+> stranding unlink never happens here at all; the upstream half is what protects the
+> standalone shape and the case where the jar IS ours. `platform/tests/
+> test_cookies_ownership.py` (6 tests) locks that contract from both sides — the jar
+> `gen-conf` names IS the jar the backend calls `TEMP_COOKIES_FILE`, the gate is the
+> token `COOKIES_FILE` (renaming either side alone must fail), the guard precedes
+> every `fs` call in both helpers and stays ABOVE the `isHarvesting = false` release,
+> `COOKIES_FILE` unset ⇒ both helpers byte-identical to upstream (a member partition
+> with no vault still cleans up its own jar), and the harvest still takes the lock
+> inside the `try` with the cleanup ordered before the release.
+> `git merge-file` produced the rest clean: 0 conflicts in `app.component.ts`, and
+> the patch set is **unchanged in content** at both pins — the sorted non-blank
+> added/removed line-SETS are identical across the old vendored tree and the new one
+> (`server.ts`: the 118 hub lines md5 `dab04ce5…` added over 13 upstream lines
+> `bde575bf…`; `app.component.ts`: 23 added `b9722d3b…` over 9 removed `fbb0c9c8…`;
+> 11 and 9 hunks either way, no gate added or removed). Only offsets move: `server.ts` new-side starts
+> 339→345, 1798→1814, 2184→2200, 2252→2268, 2291→2307, 2315→2331, 3565→3596,
+> 3703→3734, 3774→3805; `app.component.ts` 99→101, 124→126, 589→590, 1230→1250,
+> 1616→1636, 1645→1665, 1689→1709, 1699→1719, 1758→1786.
+> `retry-policy.ts` is a new upstream file, imported by `app.component.ts`, and it
+> touches NO URL (grep for `http`/`apiUrl`/`MOUNT`/`URL` is empty), so — like
+> `autoplay-order.ts` — it carries no mount patch and needs none.
+> `stall-guard.ts`, `retry-policy.ts`, `app.component.html`, `autoplay-order.ts`,
+> `AGENTS.md`, `ARCHITECTURE.md` and all four test files are byte-copies of the new
+> pin (`6400be42…` is the merged `server.ts`, `06d99204…` the merged
+> `app.component.ts`). **This pin needs an image rebuild for BOTH halves** —
+> `COPY stack/drivepod/backend/ ./` + `COPY stack/drivepod/backend/src` bake the
+> backend and `COPY stack/drivepod/frontend/ ./` feeds the `frontend-builder` stage —
+> unlike the 11-19 pin, which changed no frontend file. Deployed: `main-KVNTVSIQ.js`,
+> `APP_VERSION 1.17.0`, the served bundle carrying the outbox policy and the baked
+> `dist/server.js` carrying `harvestLockHeld`; rounds log
+> `Using partition vault jar at …/users/owner/cookies.txt` and
+> `GET /api/harvest-status` (as the owner tenant on `PORT=3000`) answers
+> `"isRunning":false` with `"session":{"state":"up","fresh":true}`. The pre-recreate
+> container's log held exactly ONE `Harvest already running — skipping` line, at
+> `11:55:00.409Z` while the `11:50:00.287Z` round was still transferring — one round
+> overlapping the next tick, which completed 3 s later and released the lock, not a
+> strand. `/var/log/sup/*.log` is container-local, not a volume, so recreating on the
+> rebuilt image restarts it: the current log holds one START/FINISHED pair, zero skips.
 
 > **2026-11-19 re-vendor (00f68c4 → 54620bee).** One upstream commit, the fix for
 > the harvest tab's `session status unknown` badge — and for the reason it was
@@ -185,14 +257,23 @@ moves the real state to `/data`, where the hub keeps it.
 | `POST …/watched` | passes the freshly derived list to `writeMemberProgress(req.headers['x-user'], …)`; a failed regeneration leaves both files alone | |
 | remote delete (`resolveGrabbyAudioPath` owner) | `DELETE` goes to `GRABBY_API_URL` and carries `X-Partition-Slug` (only when `HUB_SLUG` is set — an empty header value is a different request than none) plus `X-User` when the gate named one | unset ⇒ today's URL, today's headers |
 | harvest `cmd` | yt-dlp executable from `DRIVEPOD_YTDLP`; PO-token sidecar from `DRIVEPOD_BGUTIL_URL` | both default to today's values |
-| `writeTempCookiesFile()` / `deleteTempCookiesFile()` | `COOKIES_FILE` set ⇒ this partition's vault OWNS that path, so a harvest neither unlinks it at start/finish (that threw away the vault's export in the first round and left every later yt-dlp run cookieless, which is what the bot check then punished) nor overwrites it from an uploaded cookie file | `COOKIES_FILE` unset ⇒ both helpers byte-identical |
+| `writeTempCookiesFile()` / `deleteTempCookiesFile()` | `COOKIES_FILE` set ⇒ this partition's vault OWNS that path, so a harvest neither unlinks it at start/finish (that threw away the vault's export in the first round and left every later yt-dlp run cookieless, which is what the bot check then punished) nor overwrites it from an uploaded cookie file. `ca9a6f7`'s best-effort `try`/`catch` lands upstream-side; the hub's ownership refusal is this early return ABOVE that `try`, so on a hub tenant the delete returns before any syscall | `COOKIES_FILE` unset ⇒ both helpers byte-identical to upstream |
+
 
 Carried along byte-identical from upstream (no listen patch):
-`frontend/src/app/autoplay-order.ts` (the pure advance pick, imported by
-`app.component.ts`), `frontend/src/app/stall-guard.ts` (exports `streamTrackId`),
-`tests/autoplay-order.test.mjs` (T6), `tests/stall-guard.test.mjs` (T4, 64
-assertions), `tests/pure-logic.test.mjs` (T2 §16-§19: the authorship marker, the
-`folderCorruptionReason` verdict, the consume route, the session gate's file),
+`frontend/src/app/autoplay-order.ts` (the pure advance pick) and
+`frontend/src/app/retry-policy.ts` (the pure outbox policy), both imported by
+`app.component.ts` and neither naming a URL, so neither needs a mount patch and the
+patched-file set stays exactly two files;
+`frontend/src/app/stall-guard.ts` (exports `streamTrackId`,
+`mediaEventTrackId`, `mediaErrorIsTrackDefect` / `mediaErrorIsTransportError`,
+`playRejectIsTrackDefect`), `frontend/src/app/app.component.html`,
+`tests/autoplay-order.test.mjs` (T6, 49 assertions),
+`tests/stall-guard.test.mjs` (T4, 68 assertions),
+`tests/retry-policy.test.mjs` (T7, 53 assertions),
+`tests/pure-logic.test.mjs` (T2 §16-§20: the authorship marker, the
+`folderCorruptionReason` verdict, the consume route, the session gate's file, and
+the stranded-harvest-lock dead end via the exported `harvestLockHeld` seam),
 `tests/content-audit.mjs`
 (A14/A14b key orphan and grabby-label checks on the `createdAt` marker),
 `AGENTS.md`, `ARCHITECTURE.md`.
