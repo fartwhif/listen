@@ -1,32 +1,34 @@
 #!/usr/bin/env python3
 """One partition's cookie vault BROWSER, started on demand and torn down by itself.
 
-This is the browser half of a vault family. The transport half - Xvfb, x11vnc,
-websockify, the thing the noVNC door actually connects to - lives in
-platform/vnc-run.py and stays up so the door is always reachable; this process
-owns only chromium, the VNC keyboard driver, the auto sign-in daemon and the
-cookie exporter, and it starts them ONLY when something asked for a browser.
+This is the browser half of a vault family. The other two halves are always-on
+programs of their own: the transport (Xvfb, x11vnc, websockify - what the noVNC
+door actually connects to) in platform/vnc-run.py, and the session WATCHER
+(stack/vault/cookie_exporter.py, supervised as `exporter-<vault>`) that owns the
+account's session-state.json. This process owns only chromium, the VNC keyboard
+driver and the auto sign-in daemon, and it starts them ONLY when something asked
+for a browser. It does not run the exporter: the watcher that reports the session
+has to outlive the browser it reports about, so it is not this process's child.
 
 Supervisor starts `vault-<slug>` on two triggers (autostart/autorestart are false
 in the generated config, so it runs zero chromium between them): the watchdog
-starts it when the partition's cookie session goes stale (the sign-in job), and
-the always-on transport daemon starts it the moment a human opens the noVNC door
-(a healthy session, so the watchdog has nothing to fix, was exactly the case that
-used to answer "connection is closed"). From either trigger this process brings
-the browser up on the display the daemon owns, runs the exporter inside it, and
-exits as soon as its work is done. That is what enforces the owner's invariant -
-a healthy partition with nobody watching runs zero chromium - by construction.
+starts it when the watcher's verdict says the session is not live (the sign-in
+job), and the always-on transport daemon starts it the moment a human opens the
+noVNC door (a healthy session, so the watchdog has nothing to fix, was exactly
+the case that used to answer "connection is closed"). From either trigger this
+process brings the browser up on the display the daemon owns and exits as soon
+as its work is done. That is what enforces the owner's invariant - a healthy
+partition with nobody watching runs zero chromium - by construction.
 
 Start order is upstream ytcookies' own entrypoint.sh, minus the transport (which
-the daemon owns) and with the literal numbers gen-conf hands us replacing the
-container names a split deployment needed: chromium -> the VNC keyboard driver ->
-the auto sign-in daemon -> the exporter (the worker, and the only thing that
-knows whether the session is alive). It clears chromium's own leftover profile
-locks, waits for the daemon's door to be listening, then starts in that order.
-Teardown is the reverse, and it stops ONLY the processes it started - it never
-touches the daemon's X.
+the daemon owns) and minus the exporter (which is a program of its own), with the
+literal numbers gen-conf hands us replacing the container names a split
+deployment needed: chromium -> the VNC keyboard driver -> the auto sign-in daemon.
+It clears chromium's own leftover profile locks, waits for the daemon's door to
+be listening, then starts in that order. Teardown is the reverse, and it stops
+ONLY the processes it started - it never touches the daemon's X.
 
-Why a wrapper exists at all: the exporter can report a dead session but cannot
+Why a wrapper exists at all: the watcher can report a dead session but cannot
 start or stop a browser, and supervisor cannot act on the contents of a file.
 This is the piece that turns "cookies are stale" into "chromium is running" and
 "the session is live and nobody is at the door" into "chromium is not" - inside
@@ -35,12 +37,13 @@ family.py: a library fork nobody waited on became a zombie under a PID-1 node
 that never reaps, which is why each family reaps its own).
 
 Exit conditions, each meaning "nothing left to do here":
-  - session-state.json says `up`, the browser has been up HUB_VAULT_GRACE
-    seconds, and nobody is connected to the noVNC door - tearing down mid
-    sign-in would throw away the attempt that just worked;
+  - the watcher's report says `up`, THAT REPORT IS CURRENT (see VERDICT_FRESH),
+    the browser has been up HUB_VAULT_GRACE seconds, and nobody is connected to
+    the noVNC door - tearing down mid sign-in would throw away the attempt that
+    just worked;
   - a process it started died (logged, exit 1; the watchdog spaces the retry);
-  - HUB_VAULT_MAX_RUN elapsed with the session still not `up`: a human is
-    needed (2FA, CAPTCHA) and nobody came, so stop re-running a doomed browser
+  - HUB_VAULT_MAX_RUN elapsed with the session still not verifiably `up`: a human
+    is needed (2FA, CAPTCHA) and nobody came, so stop re-running a doomed browser
     and let the watchdog back off;
   - the transport never became reachable (the daemon is down): exit non-zero so
     supervisor's next wake (watchdog or door) can retry once it is back.
@@ -61,6 +64,16 @@ MAX_RUN = int(os.environ.get("HUB_VAULT_MAX_RUN", "3600"))
 # generous enough to cover a daemon restart, short enough that a wedged daemon
 # does not hang this program (autorestart is false; the next wake retries).
 X_WAIT = int(os.environ.get("HUB_VAULT_X_WAIT", "30"))
+
+# How young the watcher's `up` has to be for this process to accept it as proof.
+# The report is a FILE, and its age is the only liveness signal anybody has: the
+# watcher publishes `up` on a probe, so a verdict younger than the watcher's own
+# probe interval is an answer about NOW. Older than that, it is an answer about
+# some moment in the past - and the watcher may have died at that moment, which
+# is the exact state a browser teardown must not trust. gen-conf hands this same
+# number to the watcher's programs and to the watchdog (HUB_VAULT_VERDICT_FRESH),
+# so "is this verdict an answer?" is one knob with one answer, not three.
+VERDICT_FRESH = int(os.environ.get("HUB_VAULT_VERDICT_FRESH", "300"))
 
 
 def env(name: str, default: str = "") -> str:
@@ -126,7 +139,6 @@ def bring_up(fam: family.Family, disp: str, res: str, ws_port: int) -> bool:
     fam.spawn("vncdriver", ["python3", f"{VAULT}/vncdriver/vncdriver.py"])
     if env("GOOGLE_PASSWORD"):
         fam.spawn("auto_signin", ["python3", f"{VAULT}/auto_signin.py"])
-    fam.spawn("exporter", ["python3", f"{VAULT}/cookie_exporter.py"])
     return True
 
 
@@ -162,6 +174,7 @@ def main() -> int:
 
     started = time.time()
     told = False
+    stale_warned = False
     rc = 0
     # The daemon owns the transport; if its door is not there, this attempt is
     # pointless - exit non-zero (autorestart is false) and the next wake retries.
@@ -178,9 +191,15 @@ def main() -> int:
                 # attempt and let the watchdog decide whether to try again.
                 rc = 1
                 break
-            state, _stated = state_of(state_path)
+            state, stated = state_of(state_path)
+            # `up` in that file is NOT proof by itself now that the watcher is a
+            # separate program: the file's AGE is the only signal that a live
+            # process reached the account recently. A stale `up` is exactly what a
+            # dead watcher leaves behind, and tearing down on it would end the
+            # sign-in on the say-so of a process that stopped answering.
+            fresh = stated <= VERDICT_FRESH
             up_for = time.time() - started
-            if state == "up" and up_for >= GRACE:
+            if state == "up" and fresh and up_for >= GRACE:
                 clients = family.door_clients(ws_port)
                 if clients:
                     if not told:
@@ -190,9 +209,14 @@ def main() -> int:
                 else:
                     log(f"session up after {int(up_for)}s; tearing down")
                     break
+            if state == "up" and not fresh and not stale_warned:
+                log(f"report says 'up' but {int(stated)}s old (verdict-fresh is "
+                    f"{VERDICT_FRESH}s): the watcher is not publishing; staying")
+                stale_warned = True
             if up_for > MAX_RUN:
-                log(f"session still '{state}' after {int(MAX_RUN)}s: a human "
-                    "has to finish the sign-in through the noVNC door")
+                log(f"session still '{state}' ({int(stated)}s since the watcher "
+                    f"wrote it) after {int(MAX_RUN)}s: a human has to finish the "
+                    "sign-in through the noVNC door")
                 rc = 1
                 break
             time.sleep(5)
@@ -204,8 +228,8 @@ def main() -> int:
 
     if stopping:
         return 0
-    state, _ = state_of(state_path)
-    if state == "up":
+    state, stated = state_of(state_path)
+    if state == "up" and stated <= VERDICT_FRESH:
         return 0
     deaths = ", ".join(f"{n}={c}" for n, c in fam.dead())
     log(f"leaving with session '{state}'"

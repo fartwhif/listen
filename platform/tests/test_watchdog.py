@@ -42,6 +42,23 @@ class FakeCtl:
         return [v for v, n in self.calls if n == name]
 
 
+def states(running=(), watcher="RUNNING", uptime=40.0):
+    """`program_state` stand-in: everything in `running` is RUNNING, everything
+    else STOPPED, and every vault REPORTER (`exporter-<vault>`) in `watcher`.
+
+    The default matters here: the reporter is always-on by design, so a healthy
+    box shows it RUNNING, and `scan_vaults` probes it every pass. A fake that
+    reported it STOPPED would mix a reporter start into every list of browser
+    verbs these tests assert on; the reporter's own supervision is driven by
+    test_a_dead_reporter_is_started_whatever_the_verdict_says.
+    """
+    def state(name):
+        if name.startswith("exporter-"):
+            return (watcher, 3600.0)
+        return ("RUNNING", uptime) if name in running else ("STOPPED", 0.0)
+    return state
+
+
 @pytest.fixture
 def shared(monkeypatch, tmp_path):
     """Registry: `owner` (front) and `family`, both signing in as vault `owner`,
@@ -79,7 +96,7 @@ def test_one_start_for_a_vault_shared_by_two_partitions(shared, monkeypatch):
     each rotating the jar the other's consumers write back to."""
     ctl = FakeCtl()
     monkeypatch.setattr(wd, "ctl", ctl)
-    monkeypatch.setattr(wd, "program_state", lambda name: ("STOPPED", 0.0))
+    monkeypatch.setattr(wd, "program_state", states())
     monkeypatch.setattr(wd, "session_live",
                         lambda slug, now: (False, "no cookies.txt yet"))
     monkeypatch.setattr(wd, "log", lambda msg: None)
@@ -100,7 +117,7 @@ def test_a_member_with_no_files_of_its_own_is_not_asked_for_a_browser(shared,
     live_session(shared["data"], "owner", now)
     ctl = FakeCtl()
     monkeypatch.setattr(wd, "ctl", ctl)
-    monkeypatch.setattr(wd, "program_state", lambda name: ("STOPPED", 0.0))
+    monkeypatch.setattr(wd, "program_state", states())
     monkeypatch.setattr(wd, "log", lambda msg: None)
     wd.scan_vaults(shared["reg"], now, {})
     assert ctl.calls == [("start", "vault-kidacct")]     # family: nothing issued
@@ -116,7 +133,7 @@ def test_a_stale_host_file_starts_the_vault_program_once_for_both_tenants(shared
     ctl = FakeCtl()
     seen: list[str] = []
     monkeypatch.setattr(wd, "ctl", ctl)
-    monkeypatch.setattr(wd, "program_state", lambda name: ("STOPPED", 0.0))
+    monkeypatch.setattr(wd, "program_state", states())
     monkeypatch.setattr(wd, "log", seen.append)
     wd.scan_vaults(shared["reg"], now, {})
     assert ctl.verbs("vault-owner") == ["start"]
@@ -132,10 +149,8 @@ def test_an_idle_stop_targets_the_vault_program_not_every_partition(shared,
     live_session(shared["data"], "owner", now)
     ctl = FakeCtl()
     monkeypatch.setattr(wd, "ctl", ctl)
-    def state(name):
-        return ("RUNNING", wd.IDLE + 60) if name == "vault-owner" \
-            else ("STOPPED", 0.0)
-    monkeypatch.setattr(wd, "program_state", state)
+    monkeypatch.setattr(wd, "program_state",
+                        states(("vault-owner",), uptime=wd.IDLE + 60))
     monkeypatch.setattr(wd, "log", lambda msg: None)
     attempts: dict = {}
     wd.scan_vaults(shared["reg"], now, attempts)
@@ -157,10 +172,8 @@ def test_a_human_at_the_door_outranks_the_idle_stop(shared, monkeypatch):
     live_session(shared["data"], "owner", now)
     ctl = FakeCtl()
     monkeypatch.setattr(wd, "ctl", ctl)
-    def state(name):
-        return ("RUNNING", wd.IDLE + 60) if name == "vault-owner" \
-            else ("STOPPED", 0.0)
-    monkeypatch.setattr(wd, "program_state", state)
+    monkeypatch.setattr(wd, "program_state",
+                        states(("vault-owner",), uptime=wd.IDLE + 60))
     monkeypatch.setattr(wd.family, "door_clients", lambda ws: 1)
     seen: list[str] = []
     monkeypatch.setattr(wd, "log", seen.append)
@@ -241,3 +254,80 @@ def test_session_live_separates_the_reasons_a_vault_is_unusable(shared):
     live_session(data, "owner", now, cookie_age=wd.MAX_AGE + 120)
     live, why = wd.session_live("owner", now)
     assert live is False and f"cookies {wd.MAX_AGE + 120}s" in why
+
+
+# ------------------------------------------------------------- the reporter
+def test_a_dead_reporter_is_started_whatever_the_verdict_says(shared, monkeypatch):
+    """The invisible failure this exists for: supervisor gives up on a program
+    after startretries failures and it stays FATAL, and a FATAL reporter is not
+    visible from the vault's files - they just stop ageing, so every consumer
+    reads "unverified" and nothing names the cause. `start` is the only way back,
+    so the probe runs every pass, on EVERY vault, and independently of whether
+    the session looks usable: a live session with a dead reporter is a session
+    nobody is watching (no death notification, no auto re-auth, no harvest
+    pause) that will be judged stale at the next age check."""
+    now = time.time()
+    live_session(shared["data"], "owner", now)          # verdict: live
+    live_session(shared["data"], "kidacct", now)        # verdict: live
+    ctl = FakeCtl()
+    seen: list[str] = []
+    monkeypatch.setattr(wd, "ctl", ctl)
+    monkeypatch.setattr(wd, "program_state", states(watcher="FATAL"))
+    monkeypatch.setattr(wd, "log", seen.append)
+    attempts: dict = {}
+    wd.scan_vaults(shared["reg"], now, attempts)
+    # One revive per VAULT (kidacct is a second account, so a second reporter).
+    assert sorted(n for v, n in ctl.calls if v == "start") == \
+        ["exporter-kidacct", "exporter-owner"]
+    # A live verdict still means no browser: the reporter probe is its own job.
+    assert ctl.verbs("vault-owner") == []
+    assert all("reporter" in m for m in seen if "exporter-" in m), seen
+    # Reviving the reporter is not a browser attempt: no vault counted a start.
+    assert all(a.failures == 0 and not a.running and not a.last_start
+               for a in attempts.values()), attempts
+
+
+def test_a_running_reporter_is_left_alone(shared, monkeypatch):
+    """The always-on case must cost nothing: a healthy box has both reporters
+    RUNNING, and a `start` on a RUNNING program is a supervisor round-trip per
+    vault per scan for no reason (and would flap a program mid-probe)."""
+    now = time.time()
+    live_session(shared["data"], "owner", now)
+    live_session(shared["data"], "kidacct", now)
+    ctl = FakeCtl()
+    monkeypatch.setattr(wd, "ctl", ctl)
+    monkeypatch.setattr(wd, "program_state", states())   # watchers RUNNING
+    monkeypatch.setattr(wd, "log", lambda msg: None)
+    wd.scan_vaults(shared["reg"], now, {})
+    assert [n for v, n in ctl.calls if v == "start"] == []
+
+
+def test_a_starting_reporter_is_not_poked(shared, monkeypatch):
+    """STARTING/STOPPING are transients of a revive already in flight (or of the
+    autorestart the supervisor is doing itself); starting again would stack
+    starts on one process."""
+    now = time.time()
+    live_session(shared["data"], "owner", now)
+    for transient in ("STARTING", "STOPPING"):
+        ctl = FakeCtl()
+        monkeypatch.setattr(wd, "ctl", ctl)
+        monkeypatch.setattr(wd, "program_state", states(watcher=transient))
+        monkeypatch.setattr(wd, "log", lambda msg: None)
+        wd.scan_vaults(shared["reg"], now, {})
+        assert ctl.verbs("exporter-owner") == [], transient
+
+
+def test_a_failed_reporter_revive_is_named_not_swallowed(shared, monkeypatch):
+    """If supervisor refuses the start (a program with a bad command line, a
+    vanished script), the log has to say so: the alternative symptom is files
+    that stopped ageing, which points at the vault, not at supervision."""
+    now = time.time()
+    live_session(shared["data"], "owner", now)
+    ctl = FakeCtl(rc=1)
+    seen: list[str] = []
+    monkeypatch.setattr(wd, "ctl", ctl)
+    monkeypatch.setattr(wd, "program_state", states(watcher="FATAL"))
+    monkeypatch.setattr(wd, "log", seen.append)
+    wd.scan_vaults(shared["reg"], now, {})
+    assert ctl.verbs("exporter-owner") == ["start"]
+    assert any("exporter-owner" in m and "start failed" in m for m in seen), seen

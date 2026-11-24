@@ -57,8 +57,9 @@ def vault_of(reg: dict, slug: str) -> tuple[str, str]:
     """(vault id, host partition) for the vault `slug` signs in with.
 
     Supervisor programs are named after the VAULT (platform/gen-conf.py
-    vault_hosts), because one vault id is one Google account and only one browser
-    family may serve it. So `hub vault start kid` for a partition that shares
+    vault_hosts), because one vault id is one Google account: only one browser
+    family may sign it in, and only one watcher may report it. So `hub vault start
+    kid` for a partition that shares
     vault "owner" has to talk to program `vault-owner` - and the operator has to
     see that this starts sign-in for every partition named on that vault, not for
     `kid` alone.
@@ -404,13 +405,21 @@ def cmd_vault(a) -> int:
     reg = registry()
     vault, host = vault_of(reg, a.slug)
     name = f"vault-{vault}"
+    watcher = f"exporter-{vault}"
     members = [s for s in reg.get("slugs", [])
                if vault_of(reg, s)[0] == vault]
     if a.action == "status":
-        # Both halves of the vault: the always-on transport (vnc-<vault>) is what
-        # makes the noVNC door answer, the demand browser (vault-<vault>) is what
-        # signs the account in. A door that says "connection is closed" is the
-        # transport, and an operator looking at `vault status` has to see it.
+        # All three halves of the vault, most-informative first.
+        # `exporter-<vault>` is the session WATCHER (always on): the only writer
+        # of session-state.json, so if IT is down nobody is reporting the account
+        # and nothing can be announced to ntfy - the first thing to look at when
+        # "the notifications stopped". `vnc-<vault>` is the always-on TRANSPORT
+        # that makes the noVNC door answer (a door that says "connection is
+        # closed" is this one). `vault-<vault>` is the demand BROWSER that signs
+        # the account in - STOPPED is its healthy resting state, which is exactly
+        # why looking at it alone tells you nothing.
+        print(f"-- watcher (exporter-{vault}: session verdict + notifications) --")
+        ctl("status", watcher)
         print(f"-- transport (vnc-{vault}: noVNC door) --")
         ctl("status", f"vnc-{vault}")
         print(f"-- browser (vault-{vault}: sign-in) --")
@@ -419,15 +428,23 @@ def cmd_vault(a) -> int:
         return rc
     if a.action == "logs":
         logs = os.environ.get("HUB_VAULT_LOG_DIR", "/var/log/sup")
-        path = os.path.join(logs, f"{name}.log")
-        try:
-            with open(path) as fh:
-                sys.stdout.write("".join(fh.readlines()[-int(a.lines):]))
-        except OSError as exc:
-            print(f"hub: {exc}", file=sys.stderr)
-            return 1
+        # The watcher's log FIRST: it holds the session verdicts, the probes and
+        # every ntfy/webhook push, and it keeps writing while the browser log sits
+        # empty between sign-ins. Tailing only the browser log is how "no
+        # notifications" looked like a dead channel instead of a stopped reporter.
+        # A missing file is printed, not fatal: supervisor creates it on the
+        # program's first start, so a never-started watcher reads as absent.
+        rc = 0
+        for label, prog in (("watcher", watcher), ("browser", name)):
+            print(f"-- {label} ({prog}.log, last {a.lines} lines) --")
+            try:
+                with open(os.path.join(logs, f"{prog}.log")) as fh:
+                    sys.stdout.write("".join(fh.readlines()[-int(a.lines):]))
+            except OSError as exc:
+                print(f"hub: {exc}")
+                rc = 1
         _vault_note(vault, host, members)
-        return 0
+        return rc
     if a.action in ("start", "stop", "restart"):
         rc = ctl(a.action, name)
         _vault_note(vault, host, members)

@@ -21,6 +21,11 @@ Two jobs, one process, two cadences:
    file fresh, so a member with no browser of its own is still served.
    platform/vault-run.py is the inner decider and normally exits by itself;
    what the watchdog owns that vault-run structurally cannot:
+     - KEEPING THE REPORTER ALIVE (`exporter-<vault>`). supervisor autorestarts it,
+       but a program that fails startretries times goes FATAL and supervisor stops
+       trying, and a FATAL reporter is invisible from the files it owns: they just
+       stop ageing, every consumer reads "unverified", and nothing names the cause.
+       `start` revives a FATAL program, so the scan probes it every pass;
      - STARTING the family when a session goes stale - the exporter can only
        report the problem, and supervisor cannot act on the contents of a file;
      - STOPPING a family that is stuck RUNNING with a live session (the idle
@@ -201,6 +206,23 @@ def scan_vaults(reg: dict, now: float, attempts: dict[str, Attempt]) -> None:
     for vault, host in gen_conf.vault_hosts(reg).items():
         name = f"vault-{vault}"
         st = attempts.setdefault(vault, Attempt())
+        # The reporter first, whatever the verdict says. supervisor already
+        # autorestarts the watcher, but a program that fails 3 times in a row goes
+        # FATAL and supervisor stops trying - and a FATAL reporter is INVISIBLE
+        # from the vault's files: they simply stop ageing, every consumer reads
+        # "unverified", and nothing ever names the cause. `start` is how you pull
+        # a FATAL program back (supervisor honours it for a program it gave up
+        # on), so one probe per scan is what makes the reporter's absence
+        # self-healing instead of permanent.
+        watcher = f"exporter-{vault}"
+        wstate, _ = program_state(watcher)
+        if wstate not in ("RUNNING", "STARTING", "STOPPING"):
+            log(f"{watcher}: {wstate}; starting (the session reporter has to "
+                "exist whatever the verdict says)")
+            r = ctl("start", watcher)
+            if r.returncode:
+                log(f"{watcher}: start failed: "
+                    f"{r.stdout.strip() or r.stderr.strip()}")
         live, why = session_live(host, now)
         state, uptime = program_state(name)
         running = state in ("RUNNING", "STARTING", "STOPPING")

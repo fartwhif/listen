@@ -20,7 +20,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 | `stack/grabbytube/` | `fartwhif/GrabbyTube` | `b1c27088e3e7ce91c2812a8d2d630bf79ab0c7de` (2026-11-18) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `a310334e6ddcdde49bba71bc30555b6903462958` (2026-11-18) | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
-| `stack/vault/` | `fartwhif/ytcookies` | `8c3d0903b58f1576e349ff2b6c8d97d688a61851` | 1 |
+| `stack/vault/` | `fartwhif/ytcookies` | `267fc302a2a443c8de4cc06b59d50454bd3f7c0b` (2026-11-23) | 1 |
 | `stack/streamfix/` | `FrogRock/dnas/stream-fix` (same SHA) | `7585c5479ad23d234065c379761a78de2c266591` | 0 |
 | `vendor/bgutil/server/` | `Brainicism/bgutil-ytdlp-pot-provider` tag `2.0.2` | tag 2.0.2 | 0 |
 
@@ -553,24 +553,42 @@ bakes it, so this pin bump wants a rebuild.
 | `server.ts` | `HOST` env (default `0.0.0.0`, i.e. today) and `server.listen(PORT, HOST)`: the hub publishes only the front broadcaster, so the others bind loopback. `normalizePath()` also strips a gateway mount (`/l/<slug>/cache/`) because DrivePod writes index.json **gateway-prefixed** and FrogRock reads that same file off disk — it owns the inverse of the prefixing, and the mount is matched generically because a broadcaster is never told its own slug and the index can name any partition | `HOST` unset ⇒ today |
 | `public/player.html` | `API_BASE = new URL('.', document.baseURI).pathname` (`''` at `/`, the mount otherwise) applied to the status/playlist/shoutcast calls, `/api/thumb`, the stream URL and mediaSession artwork; the Shoutcast icon ref made relative. Works under `/`, `/radio/` and `/l/<slug>/radio/` with one file | served at `/` ⇒ `API_BASE` empty ⇒ today's URLs |
 
-## `stack/vault/` — ytcookies @ 8c3d090
+## `stack/vault/` — ytcookies @ 267fc30
 
-`cookie_exporter.py` (4 hunks)
+`cookie_exporter.py` (7 hunks against the pin, default context)
 
-`DRIVEPOD_PUSH_URLS` / `GRABBY_PUSH_URLS` accept comma lists (one vault serves
-every partition that shares it, so the UA push has to reach all of their apps),
-`_push_ua()` pushes to each and reports `ok` if any landed — which is what stops
-`main()`'s retry loop from pushing again — with the pre-hub one-target wording
-kept verbatim for a single URL. `sync_user_agent()` adds `X-Partition-Slug` so a
-shared vault cannot let one partition's exporter speak for another.
+| Hunk | Patch | Gate |
+|---|---|---|
+| env block after `SESSION_STATE_PATH` | `COOKIE_FANOUT_FILES` / `COOKIE_SESSION_STATE_FANOUT`: comma lists of the **member** partitions' jar and state-file paths, rendered by `vault_env` from the registry. `write_session_state()` mirrors the payload to each member's state file **unconditionally** (no consumer ever writes that file, and its mtime is what their watchdogs judge liveness from), and `fanout_jar()` mirrors an accepted jar text per path under the SAME external-write hold-off the primary write obeys. `_export_if_ok()` fans out only after the primary write succeeded, so no member gets a jar the host did not accept | unset ⇒ `[]` ⇒ the single-file behavior, byte-for-byte the pre-hub exporter |
+| env block after `GRABBY_API_URL` | `DRIVEPOD_PUSH_URLS` / `GRABBY_PUSH_URLS` accept comma lists (one vault serves every partition that shares it, so the UA push has to reach all of their apps); `HUB_SLUG` names this partition on every push so a shared vault cannot let one partition's exporter speak for another | unset ⇒ `[DRIVEPOD_API_URL]` / `[GRABBY_API_URL]`, no header |
+| `_http_post_json` | optional `extra_headers` merged into the request | no argument ⇒ today's headers |
+| before `sync_user_agent` | `_push_ua()`: push to each URL of one family, `ok` if ANY landed — which is what stops `main()`'s retry loop from pushing again — with the pre-hub one-target `ok`/`fail` wording kept verbatim for a single URL | one URL ⇒ today's wording exactly |
+| `sync_user_agent` (2 hunks) | the family push goes through `_push_ua()` with `X-Partition-Slug: $HUB_SLUG`; the log line reports per-family tallies | `HUB_SLUG` unset ⇒ no header; single URL ⇒ today's summary string |
 
-Nothing else needed patching: the exporter already reads its paths and endpoints
-from the environment (`COOKIES_FILE`, `COOKIE_SESSION_STATE`, `CDP_HOST`/`CDP_PORT`,
+Nothing else needed patching: the exporter already reads its paths and endpoints from
+the environment (`COOKIES_FILE`, `COOKIE_SESSION_STATE`, `CDP_HOST`/`CDP_PORT`,
 `VNC_DRIVER_URL`, `VNC_URL`), which is how `tenant_env`/`vault_env` aim it at a
-partition home and loopback ports. `auto_signin.py` and
-`vncdriver/vncdriver.py` are byte-identical to upstream; the browser family
-(Xvfb/x11vnc/websockify/chromium) is launched by `platform/vault-run.py`
-instead of the old `entrypoint.sh`.
+partition home and loopback ports. `auto_signin.py`, `README.md` and
+`vncdriver/vncdriver.py` are byte-identical to upstream (verified with `cmp` at
+`267fc30`); the browser family (Xvfb/x11vnc/websockify/chromium) is launched by
+`platform/vault-run.py` instead of the old `entrypoint.sh`, and the watcher itself
+is now an always-on supervisor program (`exporter-<vault>`, `gen-conf.py`).
+
+The patch set did not grow or change meaning at this pin, and the accounting says
+so. Set-difference against the pin (blank lines dropped, sorted): the vendored tree
+now adds **84** non-blank lines the pin lacks and omits **10** it has; against
+`8c3d090` it added **117** and omitted **20** — both new sets are strict *subsets*
+of the old ones (`A_new ⊆ A_old`, `R_new ⊆ R_old`, checked), so no new hub patch
+appeared and nothing upstream was newly suppressed. What left are lines upstream
+wrote itself at `267fc30` (`bootstrap_state()`, `death_detail()`, the startup
+verdict and their comments moved from hub-side patch to upstream text): 23 of the
+33 are in the pin's own text — 22 verbatim, and the bare `state = bootstrap_state()`
+call as the pin's own commented line — the other 10 are hub comment for behaviour
+the pin documents in its own words. The 23 lines that carry the fan-out and push
+mechanism (`COOKIE_FANOUT_FILES`, `fanout_jar`, `_push_ua`, `HUB_SLUG`,
+`X-Partition-Slug`, `extra_headers`, the two URL lists, `state_payload`) are
+identical line for line between the two vendored files. That is also why the hunk
+count fell 9 → 7: the hub no longer re-implements the startup verdict.
 
 ## `stack/streamfix/` and `vendor/bgutil/` — unmodified
 

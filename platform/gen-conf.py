@@ -51,7 +51,10 @@ REGISTRY = os.environ.get("HUB_REGISTRY") or \
     os.environ.get("HUB_DATA_DIR", "/data").rstrip("/") + "/partitions.json"
 STACK = os.environ.get("STACK_DIR", "/srv/stack")
 DATA = os.environ.get("HUB_DATA_DIR", "/data")
-# The public domain every door URL and the picker are built from (see vnc_door).
+# The host a human has to reach the portal on, which is what the noVNC door URL
+# is built from (vnc_door): that link travels inside a session-death notification
+# to a phone, so it has to name the host the hub actually answers on, not the
+# apex. The picker's own links are relative and never consult this.
 # A constant for the same reason as every other path here: a test (and a
 # partition add) must see the same value the emitters see, not re-read the
 # environment mid-generation.
@@ -116,12 +119,27 @@ TUNESTER_KEYS = (
 )
 VAULT_KEYS = (
     "GOOGLE_EMAIL", "GOOGLE_PASSWORD", "VNC_PASSWORD", "VNC_RESOLUTION",
-    "NTFY_TOPIC", "AUTO_SIGNIN_DELAY_MIN", "AUTO_SIGNIN_DELAY_MAX",
+    "NTFY_TOPIC", "NOTIFY_WEBHOOK_URL",
+    "AUTO_SIGNIN_DELAY_MIN", "AUTO_SIGNIN_DELAY_MAX",
     "AUTO_SIGNIN_POLL", "AUTO_SIGNIN_FLOW_MAX_AGE", "AUTO_SIGNIN_MAX_ATTEMPTS",
     "COOKIE_POLL_INTERVAL", "COOKIE_SESSION_PROBE", "COOKIE_EXTERNAL_COOLDOWN",
     "COOKIE_IMPORT_RETRY",
+    # The session WATCHER's own cadences (stack/vault/cookie_exporter.py): how
+    # often it re-proves the jar, how old a verdict may get before it stops being
+    # an answer, how often it re-publishes while nothing changed, and how often
+    # it re-asks the browser for its user agent. Both vault processes read them.
+    "COOKIE_PROBE_ON_CHANGE", "COOKIE_SESSION_STALE", "COOKIE_STATE_HEARTBEAT",
+    "COOKIE_UA_SYNC",
     # vault-run's own lifecycle knobs (see platform/vault-run.py)
     "HUB_VAULT_GRACE", "HUB_VAULT_MAX_RUN",
+    # How fresh the watcher's `up` has to be before the BROWSER may tear itself
+    # down (platform/vault-run.py). Deliberately NOT in WATCHDOG_KEYS: the browser
+    # needs the tight bound because it is about to end its own attempt on that
+    # answer, while the watchdog's own bound is HUB_VAULT_MAX_AGE - three probe
+    # intervals, deliberately looser, because acting on a verdict there means
+    # starting a chromium, and a heartbeat that slipped a tick must not buy a
+    # browser restart.
+    "HUB_VAULT_VERDICT_FRESH",
 )
 HUB_KEYS = ("HUB_COOKIE", "HUB_RADIO_PASS", "HUB_AUTH_DEBUG",
             "HUB_OWNER_USER", "HUB_OWNER_PASSWORD")
@@ -371,14 +389,16 @@ def pool_env(reg: dict) -> str:
 
 
 def vault_env(slug: str, spec: dict, reg: dict) -> str:
-    """A vault family (chromium, Xvfb, x11vnc, websockify, the VNC keyboard
-    driver, the cookie exporter, the auto sign-in daemon) gets its partition's
-    tenant env - which already carries the vault dirs, the loopback API URLs
-    and the per-vault browser ports - plus the Google/VNC credentials, the
-    public door URL and the FAN-OUT targets.
+    """A vault BROWSER family (chromium, the VNC keyboard driver, the auto
+    sign-in daemon) gets its partition's tenant env - which already carries the
+    vault dirs, the loopback API URLs and the per-vault browser ports - plus the
+    Google/VNC credentials, the public door URL and the FAN-OUT targets. The
+    Xvfb/x11vnc/websockify transport is a separate always-on program (see
+    transport_env) and the session watcher a third (see exporter_env); this one
+    is only ever started when a browser is actually wanted.
 
     `slug` here is the vault's HOST (see vault_hosts); the family serves every
-    partition that names this vault, so the exporter's user-agent push has to
+    partition that names this vault, so the watcher's user-agent push has to
     reach all of their apps (the comma URL lists) and its writes have to land in
     all of their cookie paths:
 
@@ -386,11 +406,11 @@ def vault_env(slug: str, spec: dict, reg: dict) -> str:
       state files. Each partition's apps read their own COOKIES_FILE, so the
       host's verified jar has to be copied there or a member's session ages out
       with no browser of its own to refresh it. The HOST'S OWN paths are not in
-      these lists: the exporter keeps writing them the way it always did, and it
+      these lists: the watcher keeps writing them the way it always did, and it
       is the only writer of `up` for this account.
 
     The single-valued DRIVEPOD_API_URL / GRABBY_API_URL from the tenant env stay
-    as they are (the host partition), so the exporter works on one partition
+    as they are (the host partition), so the watcher works on one partition
     whether or not it has been taught the list forms.
 
     Credential precedence is the registry first: `GOOGLE_EMAIL`/`GOOGLE_PASSWORD`
@@ -401,6 +421,14 @@ def vault_env(slug: str, spec: dict, reg: dict) -> str:
     account while each partition's apps keep writing a different jar - the
     browser would be authenticating somebody else's session.
     """
+    return env_str(vault_vals(slug, spec, reg))
+
+
+def vault_vals(slug: str, spec: dict, reg: dict) -> dict:
+    """The same map vault_env renders, as a map: the browser family gets all of
+    it, and exporter_vals is the subset the session watcher is allowed to have.
+    Two renderings of one build is what keeps the browser and the watcher from
+    disagreeing about which jar, which door URL and which consumers they mean."""
     companions = [ports(reg["partitions"][s]["index"]) for s in reg["slugs"]
                   if reg["partitions"][s]["vault_slug"] == spec["vault_slug"]]
     paths = companion_paths(reg, slug)
@@ -410,7 +438,7 @@ def vault_env(slug: str, spec: dict, reg: dict) -> str:
             "GRABBY_PUSH_URLS": ",".join(
                 f"http://127.0.0.1:{p['grabby']}" for p in companions)}
     # Omitted, not empty, when the vault has no members: unset is exactly "no
-    # companions" to the exporter, and an empty quoted value in the generated
+    # companions" to the watcher, and an empty quoted value in the generated
     # file reads like a path that went missing.
     if paths["cookies"]:
         vals["COOKIE_FANOUT_FILES"] = ",".join(paths["cookies"])
@@ -419,7 +447,74 @@ def vault_env(slug: str, spec: dict, reg: dict) -> str:
     merged = dict(passthrough(VAULT_KEYS))   # the container's .env: the fallback
     merged.update(tenant_vals(slug, spec))   # registry settings win over it
     merged.update(vals)                      # the family's own wiring wins most
-    return env_str(merged)
+    return merged
+
+
+# Every name stack/vault/cookie_exporter.py reads from the environment, as it
+# stands today. The always-on session watcher's env is EXACTLY this intersection
+# with what the tenant already knows (see exporter_env), which is what lets it
+# run with no browser: it never gets chromium's display, profile or driver knobs,
+# because a watcher that grew a dependency on one would stop being the process
+# that can sit beside a parked vault for a week. A rename or a new knob on the
+# exporter side fails platform/tests/test_watcher_program.py, not a production
+# tune that silently keeps its compiled-in default.
+EXPORTER_READS = frozenset({
+    # the jar and its liveness report (plus the member copies it mirrors)
+    "COOKIES_FILE", "COOKIE_SESSION_STATE", "COOKIE_FANOUT_FILES",
+    "COOKIE_SESSION_STATE_FANOUT",
+    # its cadences
+    "COOKIE_POLL_INTERVAL", "COOKIE_SESSION_PROBE", "COOKIE_EXTERNAL_COOLDOWN",
+    "COOKIE_IMPORT_RETRY", "COOKIE_PROBE_ON_CHANGE", "COOKIE_SESSION_STALE",
+    "COOKIE_STATE_HEARTBEAT", "COOKIE_UA_SYNC",
+    # the browser it reads the jar from and re-asks for a user agent
+    "CDP_HOST", "CDP_PORT",
+    # the consumers it pushes the user agent to
+    "HUB_SLUG", "DRIVEPOD_API_URL", "GRABBY_API_URL", "DRIVEPOD_PUSH_URLS",
+    "GRABBY_PUSH_URLS",
+    # the account it speaks for (Google password: only its presence decides the
+    # death message's "auto re-auth in progress" vs "re-sign in") and the door a
+    # human needs when nothing automatic can finish the sign-in
+    "GOOGLE_EMAIL", "GOOGLE_PASSWORD", "VNC_URL",
+    # notification channels
+    "NTFY_TOPIC", "NOTIFY_WEBHOOK_URL",
+})
+
+
+def exporter_vals(slug: str, spec: dict, reg: dict) -> dict:
+    """What the always-on session WATCHER gets: the vault's wiring, minus every
+    name the watcher never asks about.
+
+    Same precedence as vault_env (`.env` fallback < tenant settings < this
+    family's own wiring) and the same fan-out/door values, because the watcher is
+    the process that speaks FOR the vault: its report is the only writer of `up`
+    for the account, its jar mirrors to every member, and its death message has
+    to carry the door URL. What it must NOT get is the browser's world - no
+    DISPLAY, no profile dir, no VNC driver port - so the file that reads only
+    EXPORTER_READS stays the honest description of a browserless process.
+    """
+    return {k: v for k, v in vault_vals(slug, spec, reg).items()
+            if k in EXPORTER_READS}
+
+
+def exporter_env(slug: str, spec: dict, reg: dict) -> str:
+    return env_str(exporter_vals(slug, spec, reg))
+
+
+# The names in EXPORTER_READS that have NO usable default behind them, i.e. the
+# wiring gen-conf must always emit: unset, the watcher points at a file that does
+# not exist (`COOKIES_FILE` -> /data/cookies.txt), watches a display nobody is
+# serving (`CDP_PORT`'s default 9222 is only right for partition 0), or sends a
+# user-agent push with no slug to name the account. Cadence knobs are deliberately
+# absent - passthrough omits whatever the container's `.env` does not set, and
+# there the exporter's compiled-in default IS the deployment's value, exactly as
+# in the standalone ytcookies container. The single-valued DRIVEPOD_API_URL /
+# GRABBY_API_URL are absent too: the hub always emits the comma LIST forms
+# (DRIVEPOD_PUSH_URLS / GRABBY_PUSH_URLS below), which the exporter prefers, so
+# their standalone fallbacks are unreachable here.
+MUST_ISSUE = frozenset({
+    "COOKIES_FILE", "COOKIE_SESSION_STATE", "CDP_HOST", "CDP_PORT", "HUB_SLUG",
+    "DRIVEPOD_PUSH_URLS", "GRABBY_PUSH_URLS", "VNC_URL",
+})
 
 
 def transport_env(slug: str, spec: dict) -> str:
@@ -444,8 +539,9 @@ def transport_env(slug: str, spec: dict) -> str:
 def vnc_door(slug: str) -> str:
     """The backstop door's public URL, so the exporter's session-death message
     can point a human at the browser instead of hardcoding a hostname in
-    source. SITE_DOMAIN is the value the picker and the VPS proxies use; unset
-    leaves VNC_URL empty, which the exporter renders as a bare 'noVNC' hint.
+    source. SITE_DOMAIN is the host the hub is reachable on (the one the VPS
+    proxies `listen.<domain>` for); unset leaves VNC_URL empty, which the exporter
+    renders as a bare 'noVNC' hint.
 
     The `?path=` query is NOT decoration. The lite page builds its websocket
     URL as scheme://host[:port]/ + `path`, defaulting to the bare word
@@ -559,23 +655,45 @@ def supervisor_conf(reg: dict) -> str:
                        PRIO_PROXY, 3, 25, stopsignal="QUIT"))
 
     # ---- vaults ------------------------------------------------------
-    # Two programs per vault (below): an always-on TRANSPORT (vnc-<vault>,
-    # autostart/autorestart true) that holds the noVNC door's port up and wakes
-    # the browser the moment a human connects, and the demand BROWSER
-    # (vault-<vault>, autostart/autorestart false), whose whole point is that no
-    # chromium runs until a sign-in is stale or a human opens the door (the
-    # owner's invariant, enforced by construction). The browser is started by the
-    # watchdog (stale session), by the transport (a door connection), and by
-    # `hub vault start|stop`; the transport is supervised automatically.
+    # THREE programs per vault (below), split so that the two things that must
+    # always exist are never carried by the one thing that must not:
     #
-    # ONE program per distinct vault id (vault_hosts), named after the VAULT, not
-    # the partition: the vault id is the Google account, and starting one family
-    # per partition sharing it is what put two chromiums and two exporters on one
-    # account. The program carries the host partition's tenant env, so its
-    # browser ports, profile dir and jar are that partition's; members get their
-    # jar by fan-out and their door by proxy (see _locations).
+    #   exporter-<vault>  the session WATCHER (autostart/autorestart true).
+    #       cookie_exporter.py with no browser child: it exports when a browser
+    #       is up, watches the jar with one HTTP request when it is not, and is
+    #       the only writer of this account's session-state.json - the file whose
+    #       AGE every consumer and the watchdog judge liveness from. That is why
+    #       it is a program of its own and always on: when it was a child of the
+    #       demand browser, a parked vault had no reporter, `up` froze at the
+    #       moment the browser exited, and a session that died with nobody
+    #       looking announced itself to no one (no ntfy post, no auto re-auth,
+    #       no harvest pause) until the next time a browser happened to start.
+    #   vnc-<vault>       the TRANSPORT (autostart/autorestart true): holds the
+    #       noVNC door's port up and wakes the browser the moment a human
+    #       connects.
+    #   vault-<vault>     the demand BROWSER (autostart/autorestart false): no
+    #       chromium runs until a sign-in is stale or a human opens the door (the
+    #       owner's invariant, enforced by construction). Started by the watchdog
+    #       (verdict says the session is not live), by the transport (a door
+    #       connection), and by `hub vault start|stop`.
+    #
+    # ONE program of each per distinct vault id (vault_hosts), named after the
+    # VAULT, not the partition: the vault id is the Google account, and starting
+    # one family per partition sharing it is what put two chromiums and two
+    # exporters on one account. Each carries the HOST partition's tenant env, so
+    # its browser ports, profile dir and jar are that partition's; members get
+    # their jar by the watcher's fan-out and their door by proxy (see _locations).
     for vault, host in vault_hosts(reg).items():
-        # The transport first (priority below the browser) so the door is
+        # The reporter first (priority below both others) so a verdict exists
+        # before a browser can be woken into a vault that has no opinion yet,
+        # and below the transport so the watcher's CDP reads start against a
+        # browser that is already up rather than racing it.
+        out.append(program(
+            f"exporter-{vault}",
+            f"python3 {STACK}/vault/cookie_exporter.py",
+            f"{STACK}/vault", exporter_env(host, reg["partitions"][host], reg),
+            36, 5, 15))
+        # The transport next (priority below the browser) so the door is
         # listening before anything can wake a browser into it.
         out.append(program(
             f"vnc-{vault}",

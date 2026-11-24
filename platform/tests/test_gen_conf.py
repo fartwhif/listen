@@ -229,10 +229,11 @@ def test_supervisor_conf_programs_per_partition(two):
         "bgutil", "hubauth", "nginx", "streamfix", "tunester", "watchdog",
         "drivepod-owner", "grabbytube-owner", "frogrock-owner",
         "drivepod-family", "grabbytube-family", "frogrock-family",
-        # one TRANSPORT (vnc-<vault>, always-on websockify) plus one BROWSER
-        # (vault-<vault>, demand chromium) per distinct vault id - here both
-        # partitions name vault "owner", so one of each.
-        "vnc-owner", "vault-owner"])
+        # ONE REPORTER (exporter-<vault>, always-on jar watcher), one TRANSPORT
+        # (vnc-<vault>, always-on websockify) and one BROWSER (vault-<vault>,
+        # demand chromium) per distinct vault id - here both partitions name
+        # vault "owner", so one of each.
+        "exporter-owner", "vnc-owner", "vault-owner"])
     # radio False must remove the broadcaster, not just its port.
     two["partitions"]["family"]["radio"] = False
     assert "frogrock-family" not in program_blocks(gen.supervisor_conf(two))

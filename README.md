@@ -28,7 +28,10 @@ listen container (supervisord is PID 1, so orphans are reaped)
 ├ tunester   :8102        ONE tuner for every partition (the pool)
 ├ per partition i: drivepod 3000+i · grabby 8101 (i=0) else 8111+i
 │                        · radio 8090 (i=0) else 8200+i
-│                        · vault VNC 5901+i · websockify 8181+i (autostart=off)
+├ per vault v, run by its host partition i:
+│       exporter-<v>  session watcher (no port, always on)
+│       vnc-<v>       VNC 5901+i · websockify 8181+i (always on)
+│       vault-<v>     chromium family (autostart=off, on demand)
 └ stream-fix :8091        DNAS's relay target -> 127.0.0.1:8090
 ```
 
@@ -79,12 +82,14 @@ unaffected. Ten partitions max: the port map is arithmetic.
 ```
 
 `"vault": "owner"` means *this partition signs in as owner's Google account*. A
-vault id is an **account**, not a partition, so it gets **one** browser family:
-supervisor program `vault-<vault>`, run by the **host** — the first partition in
+vault id is an **account**, not a partition, and its programs are named after IT:
+`exporter-<vault>` is the session **watcher** (always on, no port, no browser of
+its own — see the gotcha below), `vnc-<vault>` the always-on noVNC transport,
+`vault-<vault>` the demand chromium run by the **host** — the first partition in
 slug order naming that vault. Every other partition on it gets the app programs,
 its own chromium **profile** under `vaults/<vault>/profiles/<slug>/` (two
 chromiums on one profile dir fight over the `SingletonLock`) and its own
-`cookies.txt`, which the host's exporter **fans out** to — along with its
+`cookies.txt`, which the host's watcher **fans out** to — along with its
 `session-state.json`, so a member's watchdog keeps seeing the account's real
 liveness with no browser of its own. That is the whole reason for the dedup: two
 chromiums authenticating as one account each re-type the password and each
@@ -184,7 +189,11 @@ docker compose exec listen hub reload    # regenerate + apply (nginx, supervisor
 `hub vault <verb> <slug>` addresses the **account** that slug signs in as, so on
 a shared vault it starts/stops/logs the host's one family — and prints which host
 it touched plus every partition that shares it. `restart family` when `family`
-signs in as `owner` restarts `vault-owner`. `hub partition list` labels each line
+signs in as `owner` restarts `vault-owner`. `status` and `logs` print all three
+halves, `exporter-<vault>` first, because a STOPPED browser is the healthy
+resting state: the half that reports is the watcher, and every session verdict
+and every ntfy push is in `exporter-<vault>.log`, which keeps writing while the
+browser log sits empty between sign-ins. `hub partition list` labels each line
 `(browser)` or `(via <host>)` for the same reason, and `partition rm`/`set
 --vault` say where a vault's browser moved when its host goes away.
 
@@ -244,6 +253,11 @@ source).
 - **Logs**: `docker compose logs` shows supervisord and whatever wrote to PID 1;
   each program's own log is a file — `docker compose exec listen tail -100
   /var/log/sup/grabbytube-owner.err.log`, or `hub vault logs <slug>`.
+- **A supervisor log never rotates** — `stdout_logfile_maxbytes` is unset in
+  `supervisord.conf`, so nothing bounds `/var/log/sup/<program>.log` except your
+  own `tail`. A full-file `grep` there reads an unbounded number of bytes; on
+  the noisiest program (drivepod-owner, 2.6 MB in its first hour) that is the
+  difference between a lookup and a read of the whole log.
 - **`docker exec` with a stray env**: a shell inside the container does not
   inherit a tenant's `environment=` block, so run app code through the
   supervised process or via its HTTP API, not `docker exec … python app.py`.
@@ -253,14 +267,34 @@ source).
   generator with the container's env read a registry that does not exist and
   rewrote every generated file to "no partitions" — the live gateway 404'd every
   partition while `partitions.json` sat untouched.
-- **Chromium is started on demand** (`autostart=false`), and **once per vault,
-  not per partition**: a healthy box runs zero chromium, and two tenants sharing
-  a Google account share one browser family (`vault-<vault>`, the host partition,
-  see the registry section). If a vault seems dead it is usually just idle; `hub
-  vault status <slug>` says why from the HOST's files (a member is never asked
-  for a browser of its own, so a member with no files of its own still counts as
-  live), and the watchdog starts the family when the jar goes stale
-  (`HUB_VAULT_MAX_AGE`).
+- **The session watcher is a program of its own** (`exporter-<vault>`, always
+  on) and the demand chromium (`vault-<vault>`) is only its browser. The watcher
+  is the sole writer of `session-state.json`, the only thing that can announce a
+  session death or recovery (ntfy/webhook), the only path that seeds the jar
+  from a sign-in refresh — and it owns the single-instance flock
+  (`users/<host>/exporter.lock`), so two watchers for one account is one watcher
+  and an early exit. It is one-program-per-**vault** for the same reason the
+  browser is: a second chromium's jar is a second copy of the same account's
+  cookies, and whichever polls last wins the write-back war. A browserless
+  watcher is not a watcher that does nothing: it proves the jar server-side (one
+  GET, no browser), pushes the browser's User-Agent to the consumers when a new
+  chromium reports a different one, and re-publishes its verdict every
+  `COOKIE_STATE_HEARTBEAT` (300 s) — every reader judges the report by its AGE,
+  so a verdict only written on transitions reads as "nobody is looking" 1800 s
+  later and wakes chromium for nothing.
+- **Chromium is started on demand** (`autostart=false`), **once per vault, not
+  per partition**, and a healthy box runs zero of them: `STOPPED` is the vault's
+  resting state, not a fault. It wakes for a human at the noVNC door or when the
+  watcher's verdict goes unusable, and exits ~120 s after the last door client
+  leaves. If a vault seems dead it is usually just idle — `hub vault status
+  <slug>` says why from the HOST's files (a member is never asked for a browser
+  of its own, so a member with no files of its own still counts as live), and
+  the watchdog starts the family when the jar goes stale (`HUB_VAULT_MAX_AGE`).
+- **An `up` verdict older than `HUB_VAULT_VERDICT_FRESH` (300 s) never lets the
+  browser park itself**, and an inconclusive probe downgrades it to `unknown`
+  instead of freezing it. Otherwise "my network hiccupped" becomes "keep using
+  the jar the last sign-in left behind", and a Google kill that lands while
+  nobody is looking goes unannounced again.
 - **The tuner is shared.** Two partitions asking for the same verified rip get
   one download and one blob (`<state>/pool/blobs/<sha256>.mp3`) delivered as a
   hardlink into each cache; a file any partition then rewrites detaches its own
