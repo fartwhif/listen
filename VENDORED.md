@@ -20,7 +20,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 | `stack/grabbytube/` | `fartwhif/GrabbyTube` | `b1c27088e3e7ce91c2812a8d2d630bf79ab0c7de` (2026-11-18) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `a310334e6ddcdde49bba71bc30555b6903462958` (2026-11-18) | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
-| `stack/vault/` | `fartwhif/ytcookies` | `267fc302a2a443c8de4cc06b59d50454bd3f7c0b` (2026-11-23) | 1 |
+| `stack/vault/` | `fartwhif/ytcookies` | `5583968434b77e0ef1e22768a7dd66891fa1ae29` (2026-11-24) | 1 |
 | `stack/streamfix/` | `FrogRock/dnas/stream-fix` (same SHA) | `7585c5479ad23d234065c379761a78de2c266591` | 0 |
 | `vendor/bgutil/server/` | `Brainicism/bgutil-ytdlp-pot-provider` tag `2.0.2` | tag 2.0.2 | 0 |
 
@@ -553,7 +553,7 @@ bakes it, so this pin bump wants a rebuild.
 | `server.ts` | `HOST` env (default `0.0.0.0`, i.e. today) and `server.listen(PORT, HOST)`: the hub publishes only the front broadcaster, so the others bind loopback. `normalizePath()` also strips a gateway mount (`/l/<slug>/cache/`) because DrivePod writes index.json **gateway-prefixed** and FrogRock reads that same file off disk — it owns the inverse of the prefixing, and the mount is matched generically because a broadcaster is never told its own slug and the index can name any partition | `HOST` unset ⇒ today |
 | `public/player.html` | `API_BASE = new URL('.', document.baseURI).pathname` (`''` at `/`, the mount otherwise) applied to the status/playlist/shoutcast calls, `/api/thumb`, the stream URL and mediaSession artwork; the Shoutcast icon ref made relative. Works under `/`, `/radio/` and `/l/<slug>/radio/` with one file | served at `/` ⇒ `API_BASE` empty ⇒ today's URLs |
 
-## `stack/vault/` — ytcookies @ 267fc30
+## `stack/vault/` — ytcookies @ 5583968
 
 `cookie_exporter.py` (7 hunks against the pin, default context)
 
@@ -570,11 +570,17 @@ the environment (`COOKIES_FILE`, `COOKIE_SESSION_STATE`, `CDP_HOST`/`CDP_PORT`,
 `VNC_DRIVER_URL`, `VNC_URL`), which is how `tenant_env`/`vault_env` aim it at a
 partition home and loopback ports. `auto_signin.py`, `README.md` and
 `vncdriver/vncdriver.py` are byte-identical to upstream (verified with `cmp` at
-`267fc30`); the browser family (Xvfb/x11vnc/websockify/chromium) is launched by
+`5583968`); the browser family (Xvfb/x11vnc/websockify/chromium) is launched by
 `platform/vault-run.py` instead of the old `entrypoint.sh`, and the watcher itself
 is now an always-on supervisor program (`exporter-<vault>`, `gen-conf.py`).
 
-The patch set did not grow or change meaning at this pin, and the accounting says
+`267fc30 → 5583968` is a log-noise-only move: a parked vault's refused CDP read
+now logs once an hour instead of once per poll. Upstream wrote the throttle, and
+the vendored copy carries the same text in the same place, so it is **not** a hub
+patch — the set-difference against the new pin is the same **84 / 10** as below,
+and the hunk count stays **7**.
+
+The patch set did not grow or change meaning at `267fc30`, and the accounting says
 so. Set-difference against the pin (blank lines dropped, sorted): the vendored tree
 now adds **84** non-blank lines the pin lacks and omits **10** it has; against
 `8c3d090` it added **117** and omitted **20** — both new sets are strict *subsets*
