@@ -117,7 +117,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # stdlib and pytest, so no runtime dependency is added that the apps did not
 # already have.
 RUN pip3 install --no-cache-dir \
-        "yt-dlp==2026.10.26" \
+        "yt-dlp==2026.11.23" \
         "bgutil-ytdlp-pot-provider==2.0.2" \
         "fastapi==0.115.*" "uvicorn[standard]==0.34.*" "pydantic-settings==2.*" \
         "python-multipart==0.0.*" "mutagen" "aiohttp" \
