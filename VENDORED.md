@@ -16,7 +16,7 @@ that is the invariant to preserve when re-vendoring, and the thing to test.
 
 | Tree | Upstream | SHA | Patched files |
 |---|---|---|---|
-| `stack/drivepod/` | `fartwhif/DrivePod` | `ca9a6f7603d1cce54446f077def9e79cda92ad77` (2026-11-20) | 2 |
+| `stack/drivepod/` | `fartwhif/DrivePod` | `351c45bc580829fb743c00e13aa396ef69fe3856` (2026-11-23) | 2 |
 | `stack/grabbytube/` | `fartwhif/GrabbyTube` | `b1c27088e3e7ce91c2812a8d2d630bf79ab0c7de` (2026-11-18) | 8 |
 | `stack/tunester/` | `fartwhif/tunester` | `a310334e6ddcdde49bba71bc30555b6903462958` (2026-11-18) | 3 |
 | `stack/frogrock/` | `fartwhif/FrogRock` | `7585c5479ad23d234065c379761a78de2c266591` | 2 |
@@ -40,7 +40,84 @@ moves the real state to `/data`, where the hub keeps it.
 
 ---
 
-## `stack/drivepod/` — DrivePod @ ca9a6f76
+## `stack/drivepod/` — DrivePod @ 351c45bc
+
+> **2026-11-23 re-vendor (ca9a6f7 → 351c45bc).** One upstream commit, the three
+> latches a connection that answers NOTHING leaves behind — dead Wi-Fi
+> association, a NAT-dropped flow, a phone out of coverage produce neither a
+> response nor an error for minutes, and every one of the three turned that
+> silence into permanent state:
+> (1) `_doConnectivityProbe` fetched `HEAD /api/config` with no deadline and no
+> in-flight guard, so a silent socket never settled its promise while the 3 s
+> connectivity interval and the 5 s always-on probe kept stacking requests —
+> measured against a black-hole port, 6 HEADs outstanding (Chromium's per-origin
+> cap) with ZERO ever settling, and `_runStallCheck()` runs on that promise's
+> continuations, so **the playback watchdog got no tick at all** for the whole
+> stall: the exact failure mode `stall-guard.ts` exists for became "no watchdog"
+> instead of "reload the stream". Upstream added `AbortController` +
+> `PROBE_TIMEOUT_MS` 4.5 s (a timeout IS unreachability, so it feeds the same
+> failure path), one shared `_probeInFlight` flag both probes use (their
+> continuations would otherwise all land at once and each move the failure
+> count), and a `_destroyed` gate so a late abort cannot settle onto a
+> torn-down element. (2) `shufflebag.json` was `JSON.parse(readFileSync(...))`
+> inside EVERY consumer and `writeFileSync`-truncated in place, so a torn file —
+> a kill mid-write, or this cache mount's documented post-publication
+> corruption — 500'd `PATCH /video/:id/watched` *after* the row was marked (the
+> outbox then retried into the same 500 forever), aborted harvest distribution,
+> and threw inside `pullFromShuffleBag` before its exhaustion re-init. Worst
+> case a torn `grabby-index.json` made `initShuffleBag` answer `[]` and write it
+> — rotation and every `used` mark gone — and `syncBagForWatched`'s un-watch
+> re-add pruned the bag down to one entry. Upstream made the reads tri-state
+> (`missing` | `unreadable` | `ok`: `unreadable` may not change anything on
+> disk) and `writeShuffleBag` sibling-temp + rename + skip-if-identical.
+> (3) `flushOutbox()` took the head op with no claim and three clocks reach it
+> (the head op's own backoff timer, the 3 s booster probe, the 5 s always-on
+> probe), so every tick that found the backend reachable queued **another** POST
+> for the same owed mark: measured on the app's own clocks, one reset then 100 s
+> of silence = 57 unanswered requests, 48 outstanding at once against the six
+> connections an origin gets — which stalls the `index.json` poll and the media
+> stream too — and 19 client-deadline deaths each reported a verdict, so the op
+> climbed to 20 attempts (2 earned) on requests the server never saw. Upstream
+> added `Outbox.beginAttempt()` (hands out the head op only while nothing is
+> outstanding; the flight settles from its own answer and the caller re-arms the
+> clock) and `clear()` releases the claim, because teardown drops the
+> subscription and neither callback would ever run.
+> **`git merge-file` produced BOTH patched files clean — 0 conflicts.** Upstream
+> worked in the harvest `finally`, the probe methods, the outbox flush and the
+> JSON read/write helpers; this tree's patches are the URL prefix, the cookie
+> ownership gate and the delete-route header strip, and after 11-20 the regions
+> are disjoint. The patch set is **unchanged in content** at the new pin — the
+> sorted non-blank added/removed line-SETS (vendored-vs-pin) are byte-identical
+> across the two pins, no gate added or removed (`server.ts`: the 13 upstream
+> lines md5 `bde575bf…` replaced by the 118 hub lines md5 `dab04ce5…`, 11 hunks
+> either way; `app.component.ts`: 9 upstream lines `fbb0c9c8…` replaced by 23 hub
+> lines `b9722d3b…`, 9 hunks either way). Only offsets move: `server.ts`
+> new-side starts 274→275, 2149→1881, 2202→2267, 2233→2320, 2254→2351,
+> 3497→2372…3615, 3631→3749, 3695→3807 (224–132 lines earlier, because
+> upstream's new JSON helpers replaced bulk inline `JSON.parse` blocks higher in
+> the file); `app.component.ts` 575→600, 1235→1311, 1621→1697, 1650→1726,
+> 1694→1770, 1704→1780, 1771→1847. The 11-20 row's `11 and 9 hunks` was the
+> `-U0` count for `server.ts` only; both files are 11 and 9 at the DEFAULT
+> context on either side, which is what the numbers above are.
+> Load-bearing ordering re-checked in the MERGED file, not assumed:
+> `COOKIES_EXTERNALLY_OWNED` is still the first statement of
+> `deleteTempCookiesFile()` (line 349, ahead of upstream's `try`, so a hub
+> partition's vault jar is never unlinked) and that call still precedes
+> `isHarvesting = false` in the harvest `finally`; `URL_PREFIX`/`MEDIA_PREFIX`
+> (43, 47) and the `X-Partition-Slug` strip (3860) all present.
+> `retry-policy.ts`, `stall-guard.ts`, `autoplay-order.ts`,
+> `app.component.html`, `AGENTS.md`, `ARCHITECTURE.md` and all four test files
+> are byte-copies of the new pin (`retry-policy.ts` grew `beginAttempt`/
+> `settleAttempt` there, `fc497d0c…`); the merged `server.ts` is `04646ea4…` and
+> the merged `app.component.ts` `4f5c5909…`. **This pin needs an image rebuild
+> for BOTH halves** — `COPY stack/drivepod/backend/ ./` (the `drivepod-build`
+> stage) bakes the backend and `COPY stack/drivepod/frontend/ ./` feeds
+> `frontend-builder`, whose output lands at `/var/www/drivepod` — unlike the
+> 11-19 pin, which touched no frontend file. The vendored `AGENTS.md` /
+> `ARCHITECTURE.md` / `tests/` do NOT reach the image (the runtime stage takes
+> only `drivepod/backend/{src,dist,node_modules,prisma,package.json}` plus the
+> built SPA), so those files ride along for the `-v $PWD:/src` test recipe, not
+> as baked content.
 
 > **2026-11-20 re-vendor (54620bee → ca9a6f7).** One upstream commit, three
 > transient-network latches that never released themselves — the owner's report was
